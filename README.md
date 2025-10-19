@@ -1,19 +1,8 @@
-# Welcome to OpenJDK 21 Updates!
+Java 21 modified to work with Windows Vista.
+This build will work on unmodified Vista and networking (specifically in Minecraft) works now.
 
-The JDK 21 Updates project uses two GitHub repositories.
-Updates are continuously developed in the repository [jdk21u-dev](https://github.com/openjdk/jdk21u-dev). This is the repository usually targeted by contributors.
-The [jdk21u](https://github.com/openjdk/jdk21u) repository is used for rampdown of the update releases of jdk21u and only accepts critical changes that must make the next release during rampdown. (You probably do not want to target jdk21u).
+suggested build command is this or you will get missing function errors.
 
-For more OpenJDK 21 updates specific information such as timelines and contribution guidelines see the [project wiki page](https://wiki.openjdk.org/display/JDKUpdates/JDK+21u/).
+bash configure --with-target-bits=64 --with-toolchain-version=2019 --with-extra-cflags="-DPSAPI_VERSION=1"
 
-
-For build instructions please see the
-[online documentation](https://openjdk.org/groups/build/doc/building.html),
-or either of these files:
-
-- [doc/building.html](doc/building.html) (html version)
-- [doc/building.md](doc/building.md) (markdown version)
-
-See <https://openjdk.org/> for more information about the OpenJDK
-Community and the JDK and see <https://bugs.openjdk.org> for JDK issue
-tracking.
+you can also download a pre-compiled release in the releases section. 
