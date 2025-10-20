@@ -142,6 +142,79 @@ LPTOP_LEVEL_EXCEPTION_FILTER previousUnhandledExceptionFilter = nullptr;
 
 // save DLL module handle, used by GetModuleFileName
 
+// shim for GetActiveProcessorCount
+#ifndef ALL_PROCESSOR_GROUPS
+  #define ALL_PROCESSOR_GROUPS 0xFFFF
+#endif
+
+typedef DWORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
+
+static inline DWORD GetActiveProcessorCount_Runtime(WORD group) {
+  static PFN_GetActiveProcessorCount p =
+      (PFN_GetActiveProcessorCount)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                  "GetActiveProcessorCount");
+  if (p) {
+    DWORD n = p(group);
+    if (n) return n;  // real API available
+  }
+  // fallback for XP/Vista
+  SYSTEM_INFO si; GetSystemInfo(&si);
+  return si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
+}
+
+// force all calls in this TU to go through the runtime shim
+#ifdef GetActiveProcessorCount
+  #undef GetActiveProcessorCount
+#endif
+#define GetActiveProcessorCount(g) GetActiveProcessorCount_Runtime(g)
+// end shim
+
+// shim for GetProcessGroupAffinity
+#ifndef ALL_PROCESSOR_GROUPS
+  #define ALL_PROCESSOR_GROUPS 0xFFFF
+#endif
+
+typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT);
+
+static inline BOOL GetProcessGroupAffinity_Runtime(HANDLE hProcess,
+                                                   PUSHORT GroupCount,
+                                                   PUSHORT GroupArray) {
+  static PFN_GetProcessGroupAffinity p =
+      (PFN_GetProcessGroupAffinity)GetProcAddress(GetModuleHandleA("kernel32.dll"),
+                                                  "GetProcessGroupAffinity");
+  if (p) {
+    return p(hProcess, GroupCount, GroupArray);
+  }
+
+  // ---- emulate Win7+ contract on XP/Vista (no groups) ----
+  const USHORT required = 1;
+
+  if (GroupArray == nullptr) {
+    if (GroupCount) *GroupCount = required;
+    SetLastError(ERROR_INSUFFICIENT_BUFFER);
+    return FALSE;
+  }
+
+  // caller provided a buffer. if its big enough, fill it with group 0
+  if (GroupCount && *GroupCount >= required) {
+    GroupArray[0] = 0;   // the only group id
+    *GroupCount   = 1;
+    return TRUE;
+  }
+
+  // buffer too small, tell them the required size
+  if (GroupCount) *GroupCount = required;
+  SetLastError(ERROR_INSUFFICIENT_BUFFER);
+  return FALSE;
+}
+
+// force all calls in this TU to go through the runtime shim
+#ifdef GetProcessGroupAffinity
+  #undef GetProcessGroupAffinity
+#endif
+#define GetProcessGroupAffinity(h, gc, ga) GetProcessGroupAffinity_Runtime((h), (gc), (ga))
+// end shim
+
 HINSTANCE vm_lib_handle;
 
 BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
