@@ -1935,17 +1935,21 @@ void VMError::report_and_die(int id, const char* message, const char* detail_fmt
     OnError = nullptr;
   }
 
-  if (WINDOWS_ONLY(!UseOSErrorReporting) NOT_WINDOWS(true)) {
-    // os::abort() will call abort hooks, try it first.
-    static bool skip_os_abort = false;
-    if (!skip_os_abort) {
-      skip_os_abort = true;
-      bool dump_core = should_report_bug(_id);
-      os::abort(dump_core && CreateCoredumpOnCrash, _siginfo, _context);
-    }
-    // if os::abort() doesn't abort, try os::die();
-	os::die();
+#if defined _WINDOWS
+  if (UseOSErrorReporting) {
+    raise_fail_fast(_siginfo, _context);
   }
+#endif // _WINDOWS
+
+  // os::abort() will call abort hooks, try it first.
+  static bool skip_os_abort = false;
+  if (!skip_os_abort) {
+    skip_os_abort = true;
+    bool dump_core = should_report_bug(_id);
+    os::abort(dump_core && CreateCoredumpOnCrash, _siginfo, _context);
+    // if os::abort() doesn't abort, try os::die();
+  }
+  os::die();
 }
 
 /*
