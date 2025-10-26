@@ -10,6 +10,9 @@ fair notice: If you want to play Minecraft 1.21+, LWJGL 3.3.3 is incompatible wi
 
 ```-Dorg.lwjgl.openal.libname=C:\YourFilePathWithTheOpenALFileGoesHere\OpenAL.dll```
 
+Another thing, this is targetting unmodified Windows Vista. the Vista extended kernel could cause issues with this that would otherwise not happen on a stock Vista system. 
+Compatibility is not guaranteed with the extended kernel installed.
+
 If you need to contact me for any reason, my Discord server is your best bet.
 
 - **My website**: https://win-games.uk/
