@@ -625,15 +625,50 @@ AC_DEFUN([FLAGS_SETUP_CFLAGS_HELPER],
     TOOLCHAIN_CFLAGS_JVM="-qtbtable=full -qtune=balanced -fno-exceptions \
         -qalias=noansi -qstrict -qtls=default -qnortti -qnoeh -qignerrno -qstackprotect"
   elif test "x$TOOLCHAIN_TYPE" = xmicrosoft; then
-    TOOLCHAIN_CFLAGS_JVM="-nologo -MD -Zc:preprocessor -Zc:strictStrings -MP"
-    TOOLCHAIN_CFLAGS_JDK="-nologo -MD -Zc:preprocessor -Zc:strictStrings -Zc:wchar_t-"
+    # (VS 2019 / v142+).
+    ADD_NEW_MSVC_FLAGS=false
+    if test "x$TOOLCHAIN_VERSION" != x; then
+      case $TOOLCHAIN_VERSION in
+        ''|*[!0-9]*) ;;
+        *)
+          if test "$TOOLCHAIN_VERSION" -ge 2019; then
+            ADD_NEW_MSVC_FLAGS=true
+          fi
+          ;;
+      esac
+    elif test "x$VS_VERSION_INTERNAL" != x; then
+      case $VS_VERSION_INTERNAL in
+        ''|*[!0-9]*) ;;
+        *)
+          if test "$VS_VERSION_INTERNAL" -ge 142; then
+            ADD_NEW_MSVC_FLAGS=true
+          fi
+          ;;
+      esac
+    fi
+
+    TOOLCHAIN_CFLAGS_JVM="-nologo -MD -Zc:threadSafeInit-"
+    TOOLCHAIN_CFLAGS_JDK="-nologo -MD -Zc:threadSafeInit-"
+
+    if test "x$ADD_NEW_MSVC_FLAGS" = xtrue; then
+      TOOLCHAIN_CFLAGS_JVM="$TOOLCHAIN_CFLAGS_JVM -Zc:preprocessor"
+      TOOLCHAIN_CFLAGS_JDK="$TOOLCHAIN_CFLAGS_JDK -Zc:preprocessor"
+    fi
+
+    TOOLCHAIN_CFLAGS_JVM="$TOOLCHAIN_CFLAGS_JVM -Zc:strictStrings -MP"
+    TOOLCHAIN_CFLAGS_JDK="$TOOLCHAIN_CFLAGS_JDK -Zc:strictStrings -Zc:wchar_t-"
   fi
 
   # CFLAGS C language level for JDK sources (hotspot only uses C++)
   if test "x$TOOLCHAIN_TYPE" = xgcc || test "x$TOOLCHAIN_TYPE" = xclang || test "x$TOOLCHAIN_TYPE" = xxlc; then
     LANGSTD_CFLAGS="-std=c11"
   elif test "x$TOOLCHAIN_TYPE" = xmicrosoft; then
-    LANGSTD_CFLAGS="-std:c11"
+    # -std:c11 is only supported in newer MSVC (VS 2019 / v142+).
+    if test "x$ADD_NEW_MSVC_FLAGS" = xtrue; then
+      LANGSTD_CFLAGS="-std:c11"
+    else
+      LANGSTD_CFLAGS=""
+    fi
   fi
   TOOLCHAIN_CFLAGS_JDK_CONLY="$LANGSTD_CFLAGS $TOOLCHAIN_CFLAGS_JDK_CONLY"
 

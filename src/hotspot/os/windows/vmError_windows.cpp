@@ -29,100 +29,134 @@
 #include "runtime/os.hpp"
 #include "utilities/vmError.hpp"
 
-// shim for RaiseFailFastException
-
+// RaiseFailFastException
 #ifndef FAIL_FAST_GENERATE_EXCEPTION_ADDRESS
-  #define FAIL_FAST_GENERATE_EXCEPTION_ADDRESS 0x0001
-#endif
-#ifndef FAIL_FAST_NO_HARD_ERROR_DLG
-  #define FAIL_FAST_NO_HARD_ERROR_DLG         0x0002
+#define FAIL_FAST_GENERATE_EXCEPTION_ADDRESS 0x00000001u
 #endif
 
-#ifndef STATUS_STACK_BUFFER_OVERRUN
-  #define STATUS_STACK_BUFFER_OVERRUN  ((DWORD)0xC0000409)
-#endif
 #ifndef STATUS_FAIL_FAST_EXCEPTION
-  #define STATUS_FAIL_FAST_EXCEPTION   ((DWORD)0xC0000602)
+#define STATUS_FAIL_FAST_EXCEPTION ((DWORD)0xC0000409u)
 #endif
 
-typedef VOID (WINAPI *PFN_RaiseFailFastException)(PEXCEPTION_RECORD, PCONTEXT, DWORD);
-
-#ifdef _MSC_VER
-  #include <intrin.h>
-  #pragma intrinsic(_ReturnAddress)
-#endif
-
-static inline VOID RaiseFailFastException_Runtime(PEXCEPTION_RECORD pExceptionRecord,
-                                                  PCONTEXT          pContextRecord,
-                                                  DWORD             dwFlags)
-{
-  static PFN_RaiseFailFastException p =
-      (PFN_RaiseFailFastException)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                                 "RaiseFailFastException");
-  if (p) {
-    p(pExceptionRecord, pContextRecord, dwFlags);
-    // If it returns for any reason, make sure we still die:
-    TerminateProcess(GetCurrentProcess(), (UINT)-1);
-  }
-
-  // XP/Vista
-
-  if (dwFlags & FAIL_FAST_NO_HARD_ERROR_DLG) {
-    // prevent the "This program has stopped working" GPF dialog if caller asked
-    SetErrorMode(GetErrorMode() | SEM_NOGPFAULTERRORBOX);
-  }
-
-  EXCEPTION_RECORD er;
-  if (pExceptionRecord) {
-    er = *pExceptionRecord;
-    er.ExceptionFlags |= EXCEPTION_NONCONTINUABLE;
-    if (!er.ExceptionCode) {
-      er.ExceptionCode = STATUS_STACK_BUFFER_OVERRUN;
-    }
-    if (!er.ExceptionAddress && (dwFlags & FAIL_FAST_GENERATE_EXCEPTION_ADDRESS)) {
-#ifdef _MSC_VER
-      er.ExceptionAddress = _ReturnAddress();
+#if defined(_MSC_VER)
+#include <intrin.h>
+#pragma intrinsic(_ReturnAddress)
+static __forceinline void* CompatReturnAddress(void) { return _ReturnAddress(); }
+#elif defined(__GNUC__) || defined(__clang__)
+static __inline__ void* CompatReturnAddress(void) { return __builtin_return_address(0); }
 #else
-      er.ExceptionAddress = (PVOID)RaiseFailFastException_Runtime; // best we can do portably
+static __inline__ void* CompatReturnAddress(void) { return NULL; }
 #endif
+
+#if defined(_M_IX86) && defined(_MSC_VER)
+static __forceinline void CompatCaptureContextX86(PCONTEXT ctx)
+{
+    ZeroMemory(ctx, sizeof(*ctx));
+    ctx->ContextFlags = CONTEXT_CONTROL;
+    __asm {
+        mov eax, ctx
+        mov [eax]CONTEXT.Ebp, ebp
+        mov [eax]CONTEXT.Esp, esp
+        call $+5
+        pop edx
+        mov [eax]CONTEXT.Eip, edx
     }
-  } else {
-    ZeroMemory(&er, sizeof(er));
-    er.ExceptionCode  = STATUS_STACK_BUFFER_OVERRUN; // recognized by WER down-level
-    er.ExceptionFlags = EXCEPTION_NONCONTINUABLE;
-#ifdef _MSC_VER
-    if (dwFlags & FAIL_FAST_GENERATE_EXCEPTION_ADDRESS) {
-      er.ExceptionAddress = _ReturnAddress();
-    }
-#endif
-    // if the caller provided a context with subcode info
-    // there is no way to pass it to RaiseException directly. we will ignore it
-  }
-
-  // convert EXCEPTION_RECORD params to RaiseException form.
-  ULONG_PTR params[EXCEPTION_MAXIMUM_PARAMETERS];
-  DWORD nparams = 0;
-  if (er.NumberParameters <= EXCEPTION_MAXIMUM_PARAMETERS) {
-    nparams = er.NumberParameters;
-    for (DWORD i = 0; i < nparams; ++i) params[i] = er.ExceptionInformation[i];
-  }
-
-  __try {
-    RaiseException(er.ExceptionCode, er.ExceptionFlags, nparams, nparams ? params : NULL);
-  } __except (EXCEPTION_EXECUTE_HANDLER) {
-    // if somebody catches it, refuse to continue. this hopefully mirrors fail-fast
-  }
-
-  TerminateProcess(GetCurrentProcess(), (UINT)er.ExceptionCode);
-  // no return
 }
-
-// force all calls in this TU to go through the shim
-#ifdef RaiseFailFastException
-  #undef RaiseFailFastException
 #endif
-#define RaiseFailFastException(per, pctx, flg) RaiseFailFastException_Runtime((per), (pctx), (flg))
-// end shim
+
+static VOID WINAPI
+CompatRaiseFailFastException(PEXCEPTION_RECORD pExceptionRecord,
+                            PCONTEXT          pContextRecord,
+                            DWORD             dwFlags)
+{
+    typedef VOID (WINAPI *PFN_RaiseFailFastException)(PEXCEPTION_RECORD, PCONTEXT, DWORD);
+    typedef LONG (NTAPI *PFN_NtRaiseException)(PEXCEPTION_RECORD, PCONTEXT, BOOLEAN);
+    typedef VOID (WINAPI *PFN_RtlCaptureContext)(PCONTEXT);
+
+    static PFN_RaiseFailFastException pRaiseFailFastException = NULL;
+    static PFN_NtRaiseException       pNtRaiseException       = NULL;
+    static PFN_RtlCaptureContext      pRtlCaptureContext      = NULL;
+    static LONG initState_RFFE = 0;
+
+    if (InterlockedCompareExchange(&initState_RFFE, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pRaiseFailFastException = (PFN_RaiseFailFastException)
+                GetProcAddress(hKernel32, "RaiseFailFastException");
+            pRtlCaptureContext = (PFN_RtlCaptureContext)
+                GetProcAddress(hKernel32, "RtlCaptureContext");
+        }
+        {
+            HMODULE hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+            if (hNtdll) {
+                pNtRaiseException = (PFN_NtRaiseException)
+                    GetProcAddress(hNtdll, "NtRaiseException");
+            }
+        }
+        InterlockedExchange(&initState_RFFE, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_RFFE, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pRaiseFailFastException != NULL) {
+        pRaiseFailFastException(pExceptionRecord, pContextRecord, dwFlags);
+        TerminateProcess(GetCurrentProcess(), STATUS_FAIL_FAST_EXCEPTION);
+        return;
+    }
+
+    EXCEPTION_RECORD localEr;
+    CONTEXT          localCtx;
+    PEXCEPTION_RECORD er  = pExceptionRecord ? pExceptionRecord : &localEr;
+    PCONTEXT          ctx = pContextRecord   ? pContextRecord   : &localCtx;
+
+    if (pExceptionRecord == NULL) {
+        ZeroMemory(&localEr, sizeof(localEr));
+        er->ExceptionCode = STATUS_FAIL_FAST_EXCEPTION;
+        er->ExceptionFlags = EXCEPTION_NONCONTINUABLE;
+        er->NumberParameters = 1;
+        er->ExceptionInformation[0] = 0;
+    }
+
+    if ((dwFlags & FAIL_FAST_GENERATE_EXCEPTION_ADDRESS) != 0) {
+        if (er->ExceptionAddress == NULL) {
+            er->ExceptionAddress = CompatReturnAddress();
+        }
+    }
+
+    if (pContextRecord == NULL) {
+        ZeroMemory(&localCtx, sizeof(localCtx));
+        if (pRtlCaptureContext != NULL) {
+            pRtlCaptureContext(&localCtx);
+#if defined(_M_X64)
+            if (er->ExceptionAddress != NULL) localCtx.Rip = (DWORD64)(ULONG_PTR)er->ExceptionAddress;
+#elif defined(_M_IX86)
+            if (er->ExceptionAddress != NULL) localCtx.Eip = (DWORD)(ULONG_PTR)er->ExceptionAddress;
+#endif
+#if defined(_M_IX86) && defined(_MSC_VER)
+        } else {
+            CompatCaptureContextX86(&localCtx);
+            if (er->ExceptionAddress != NULL) localCtx.Eip = (DWORD)(ULONG_PTR)er->ExceptionAddress;
+#endif
+        }
+    }
+
+    if (pNtRaiseException != NULL && ctx != NULL) {
+        pNtRaiseException(er, ctx, FALSE);
+    } else {
+        __try {
+            RaiseException(er->ExceptionCode,
+                           EXCEPTION_NONCONTINUABLE,
+                           er->NumberParameters,
+                           (er->NumberParameters ? (ULONG_PTR*)er->ExceptionInformation : NULL));
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+        }
+    }
+
+    TerminateProcess(GetCurrentProcess(), (UINT)er->ExceptionCode);
+}
+// end RaiseFailFastException
 
 LONG WINAPI crash_handler(struct _EXCEPTION_POINTERS* exceptionInfo) {
   DWORD exception_code = exceptionInfo->ExceptionRecord->ExceptionCode;
@@ -163,7 +197,7 @@ void VMError::interrupt_reporting_thread() {}
 
 void VMError::raise_fail_fast(void* exrecord, void* context) {
   DWORD flags = (exrecord == nullptr) ? FAIL_FAST_GENERATE_EXCEPTION_ADDRESS : 0;
-  RaiseFailFastException(static_cast<PEXCEPTION_RECORD>(exrecord),
+  CompatRaiseFailFastException(static_cast<PEXCEPTION_RECORD>(exrecord),
                          static_cast<PCONTEXT>(context),
                          flags);
 }

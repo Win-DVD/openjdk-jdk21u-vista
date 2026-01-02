@@ -31,6 +31,7 @@
 #include "runtime/semaphore.hpp"
 #include "utilities/debug.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 
 class ThreadClosure;
 class WorkerTaskDispatcher;
@@ -127,7 +128,7 @@ class WorkerThread : public NamedThread {
   friend class WorkerTaskDispatcher;
 
 private:
-  static THREAD_LOCAL uint _worker_id;
+  static ThreadLocalValue<uint> _worker_id;
 
   WorkerTaskDispatcher* const _dispatcher;
 

@@ -52,10 +52,8 @@
 #include "jfr/jfr.hpp"
 #endif
 
-#ifndef USE_LIBRARY_BASED_TLS_ONLY
 // Current thread is maintained as a thread-local variable
-THREAD_LOCAL Thread* Thread::_thr_current = nullptr;
-#endif
+ThreadLocalValue<Thread*> Thread::_thr_current(nullptr);
 
 // ======= Thread ========
 // Base class for all threads: VMThread, WatcherThread, ConcurrentMarkSweepThread,

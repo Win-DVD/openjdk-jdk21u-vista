@@ -40,6 +40,233 @@
 
 #include "sun_nio_fs_WindowsNativeDispatcher.h"
 
+// CreateSymbolicLinkW
+static BOOLEAN WINAPI
+CompatCreateSymbolicLinkW(LPCWSTR lpSymlinkFileName,
+                          LPCWSTR lpTargetFileName,
+                          DWORD   dwFlags)
+{
+    typedef BOOLEAN (WINAPI *PFN_CreateSymbolicLinkW)(LPCWSTR, LPCWSTR, DWORD);
+
+    static PFN_CreateSymbolicLinkW pCreateSymbolicLinkW = NULL;
+    static LONG initState_CSLW = 0;
+
+    if (InterlockedCompareExchange(&initState_CSLW, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pCreateSymbolicLinkW = (PFN_CreateSymbolicLinkW)
+                GetProcAddress(hKernel32, "CreateSymbolicLinkW");
+        }
+        InterlockedExchange(&initState_CSLW, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_CSLW, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pCreateSymbolicLinkW != NULL) {
+        return pCreateSymbolicLinkW(lpSymlinkFileName, lpTargetFileName, dwFlags);
+    }
+
+    (void)dwFlags;
+
+    if (lpSymlinkFileName == NULL || lpTargetFileName == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return FALSE;
+}
+// end CreateSymbolicLinkW
+
+// GetFinalPathNameByHandleW
+static DWORD WINAPI
+CompatGetFinalPathNameByHandleW(HANDLE hFile,
+                                LPWSTR lpszFilePath,
+                                DWORD cchFilePath,
+                                DWORD dwFlags)
+{
+    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
+
+    static PFN_GetFinalPathNameByHandleW pGetFinalPathNameByHandleW = NULL;
+    static LONG initState_GFPHBH = 0;
+
+    if (InterlockedCompareExchange(&initState_GFPHBH, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetFinalPathNameByHandleW = (PFN_GetFinalPathNameByHandleW)
+                GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+        }
+        InterlockedExchange(&initState_GFPHBH, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GFPHBH, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetFinalPathNameByHandleW != NULL) {
+        return pGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    }
+
+    (void)dwFlags;
+
+    if (hFile == NULL || hFile == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+
+    typedef LONG NTSTATUS;
+    typedef struct _UNICODE_STRING {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR  Buffer;
+    } UNICODE_STRING;
+
+    typedef struct _OBJECT_NAME_INFORMATION {
+        UNICODE_STRING Name;
+    } OBJECT_NAME_INFORMATION;
+
+    typedef enum _OBJECT_INFORMATION_CLASS {
+        ObjectNameInformation = 1
+    } OBJECT_INFORMATION_CLASS;
+
+    typedef NTSTATUS (NTAPI *PFN_NtQueryObject)(
+        HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+
+    static PFN_NtQueryObject pNtQueryObject = NULL;
+    static LONG initState_NQO = 0;
+
+    if (InterlockedCompareExchange(&initState_NQO, 1, 0) == 0) {
+        HMODULE hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (hNtdll) {
+            pNtQueryObject = (PFN_NtQueryObject)
+                GetProcAddress(hNtdll, "NtQueryObject");
+        }
+        InterlockedExchange(&initState_NQO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_NQO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pNtQueryObject == NULL) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+
+    ULONG need = 0;
+    NTSTATUS st = pNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &need);
+
+    if ((ULONG)st != 0xC0000004UL || need == 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    OBJECT_NAME_INFORMATION* oni = (OBJECT_NAME_INFORMATION*)malloc(need);
+    if (oni == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    st = pNtQueryObject(hFile, ObjectNameInformation, oni, need, &need);
+    if (st < 0) {
+        free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    if (oni->Name.Buffer == NULL || oni->Name.Length == 0) {
+        free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD ntLen = (DWORD)(oni->Name.Length / sizeof(WCHAR));
+    WCHAR* ntPath = (WCHAR*)malloc((ntLen + 1) * sizeof(WCHAR));
+    if (ntPath == NULL) {
+        free(oni);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    memcpy(ntPath, oni->Name.Buffer, ntLen * sizeof(WCHAR));
+    ntPath[ntLen] = L'\0';
+
+    free(oni);
+
+    WCHAR* finalPath = NULL;
+
+    if (wcsncmp(ntPath, L"\\Device\\Mup\\", 12) == 0) {
+        const WCHAR* tail = ntPath + 12;
+        size_t tailLen = wcslen(tail);
+        size_t outLen = 8 + tailLen; /* "\\?\UNC\" */
+        finalPath = (WCHAR*)malloc((outLen + 1) * sizeof(WCHAR));
+        if (finalPath) {
+            wcscpy(finalPath, L"\\\\?\\UNC\\");
+            wcscat(finalPath, tail);
+        }
+    } else {
+        WCHAR drives[512];
+        DWORD dlen = GetLogicalDriveStringsW((DWORD)(sizeof(drives) / sizeof(drives[0])), drives);
+        if (dlen != 0 && dlen < (DWORD)(sizeof(drives) / sizeof(drives[0]))) {
+            WCHAR* p = drives;
+            while (*p) {
+                WCHAR drive[3];
+                WCHAR dev[512];
+
+                drive[0] = p[0];
+                drive[1] = L':';
+                drive[2] = L'\0';
+
+                if (QueryDosDeviceW(drive, dev, (DWORD)(sizeof(dev) / sizeof(dev[0]))) != 0) {
+                    size_t devLen = wcslen(dev);
+                    if (devLen > 0 && wcsncmp(ntPath, dev, devLen) == 0) {
+                        const WCHAR* tail = ntPath + devLen;
+                        size_t tailLen = wcslen(tail);
+
+                        size_t outLen = 4 /* \\?\ */ + 2 /* C: */ + tailLen;
+                        finalPath = (WCHAR*)malloc((outLen + 1) * sizeof(WCHAR));
+                        if (finalPath) {
+                            wcscpy(finalPath, L"\\\\?\\");
+                            finalPath[4] = drive[0];
+                            finalPath[5] = L':';
+                            finalPath[6] = L'\0';
+                            wcscat(finalPath, tail);
+                        }
+                        break;
+                    }
+                }
+
+                p += wcslen(p) + 1;
+            }
+        }
+    }
+
+    free(ntPath);
+
+    if (finalPath == NULL) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD outChars = (DWORD)wcslen(finalPath);
+
+    if (lpszFilePath == NULL || cchFilePath == 0 || cchFilePath <= outChars) {
+        free(finalPath);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return outChars + 1;
+    }
+
+    memcpy(lpszFilePath, finalPath, outChars * sizeof(WCHAR));
+    lpszFilePath[outChars] = L'\0';
+
+    free(finalPath);
+    return outChars;
+}
+// end GetFinalPathNameByHandleW
+
+
 /**
  * jfieldIDs
  */
@@ -1081,7 +1308,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_CreateSymbolicLink0(JNIEnv* env,
     LPCWSTR link = jlong_to_ptr(linkAddress);
     LPCWSTR target = jlong_to_ptr(targetAddress);
 
-    if (CreateSymbolicLinkW(link, target, (DWORD)flags) == 0)
+    if (CompatCreateSymbolicLinkW(link, target, (DWORD)flags) == 0)
         throwWindowsException(env, GetLastError());
 }
 
@@ -1143,7 +1370,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle(JNIEnv* env,
     HANDLE h = (HANDLE)jlong_to_ptr(handle);
     DWORD len;
 
-    len = GetFinalPathNameByHandleW(h, path, MAX_PATH, 0);
+    len = CompatGetFinalPathNameByHandleW(h, path, MAX_PATH, 0);
     if (len > 0) {
         if (len < MAX_PATH) {
             rv = (*env)->NewString(env, (const jchar *)path, (jsize)len);
@@ -1151,7 +1378,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle(JNIEnv* env,
             len += 1;  /* return length does not include terminator */
             lpBuf = (WCHAR*)malloc(len * sizeof(WCHAR));
             if (lpBuf != NULL) {
-                len = GetFinalPathNameByHandleW(h, lpBuf, len, 0);
+                len = CompatGetFinalPathNameByHandleW(h, lpBuf, len, 0);
                 if (len > 0)  {
                     rv = (*env)->NewString(env, (const jchar *)lpBuf, (jsize)len);
                 } else {

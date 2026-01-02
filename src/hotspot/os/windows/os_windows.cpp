@@ -42,6 +42,7 @@
 #include "os_windows.inline.hpp"
 #include "prims/jniFastGetField.hpp"
 #include "prims/jvm_misc.hpp"
+#include "prims/upcallLinker.hpp"
 #include "runtime/arguments.hpp"
 #include "runtime/atomic.hpp"
 #include "runtime/globals.hpp"
@@ -135,85 +136,273 @@ static FILETIME process_kernel_time;
   #define __CPU__ i486
 #endif
 
+// GetTickCount64
+static ULONGLONG WINAPI
+CompatGetTickCount64(void)
+{
+    typedef ULONGLONG (WINAPI *PFN_GetTickCount64)(VOID);
+
+    static PFN_GetTickCount64 pGetTickCount64 = NULL;
+    static LONG initState_GTC64 = 0;
+
+    static LONG lock_GTC64 = 0;
+    static DWORD lastLow_GTC64 = 0;
+    static DWORD high32_GTC64 = 0;
+    static LONG haveState_GTC64 = 0;
+
+    if (InterlockedCompareExchange(&initState_GTC64, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetTickCount64 = (PFN_GetTickCount64)
+                GetProcAddress(hKernel32, "GetTickCount64");
+        }
+        InterlockedExchange(&initState_GTC64, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GTC64, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetTickCount64 != NULL) {
+        return pGetTickCount64();
+    }
+
+    while (InterlockedCompareExchange(&lock_GTC64, 1, 0) != 0) {
+        SwitchToThread();
+    }
+
+    DWORD now = GetTickCount();
+
+    if (haveState_GTC64 == 0) {
+        lastLow_GTC64 = now;
+        high32_GTC64 = 0;
+        haveState_GTC64 = 1;
+        InterlockedExchange(&lock_GTC64, 0);
+        return (ULONGLONG)now;
+    }
+
+    if (now < lastLow_GTC64) {
+        high32_GTC64++;
+    }
+
+    lastLow_GTC64 = now;
+
+    ULONGLONG result = (((ULONGLONG)high32_GTC64) << 32) | (ULONGLONG)now;
+
+    InterlockedExchange(&lock_GTC64, 0);
+    return result;
+}
+// end GetTickCount64
+
+// InitOnceExecuteOnce
+static BOOL WINAPI
+CompatInitOnceExecuteOnce(PINIT_ONCE InitOnce,
+                          PINIT_ONCE_FN InitFn,
+                          PVOID Parameter,
+                          LPVOID *Context)
+{
+    typedef BOOL (WINAPI *PFN_InitOnceExecuteOnce)(PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
+
+    static PFN_InitOnceExecuteOnce pInitOnceExecuteOnce = NULL;
+    static LONG initState_IOEO = 0;
+
+    if (InterlockedCompareExchange(&initState_IOEO, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pInitOnceExecuteOnce = (PFN_InitOnceExecuteOnce)
+                GetProcAddress(hKernel32, "InitOnceExecuteOnce");
+        }
+        InterlockedExchange(&initState_IOEO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_IOEO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pInitOnceExecuteOnce != NULL) {
+        return pInitOnceExecuteOnce(InitOnce, InitFn, Parameter, Context);
+    }
+
+    if (InitOnce == NULL || InitFn == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    for (;;) {
+        ULONG_PTR val = (ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL);
+        switch (val & 3) {
+        case 2:
+            if (Context) *Context = (PVOID)(val & ~(ULONG_PTR)3);
+            return TRUE;
+
+        case 0:
+            if ((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, (PVOID)1, NULL) == 0) {
+                PVOID ctx = NULL;
+                BOOL ok = InitFn(InitOnce, Parameter, &ctx);
+                if (ok) {
+                    if (((ULONG_PTR)ctx & 3) != 0) {
+                        SetLastError(ERROR_INVALID_PARAMETER);
+                        InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                        return FALSE;
+                    }
+                    InterlockedExchangePointer(&InitOnce->Ptr, (PVOID)((ULONG_PTR)ctx | 2));
+                    if (Context) *Context = ctx;
+                    return TRUE;
+                } else {
+                    InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                    if (GetLastError() == 0) {
+                        SetLastError(ERROR_GEN_FAILURE);
+                    }
+                    return FALSE;
+                }
+            }
+            break;
+
+        case 1:
+            while ((((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL)) & 3) == 1) {
+                SwitchToThread();
+            }
+            break;
+
+        default:
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+}
+// end InitOnceExecuteOnce
+
+// VirtualAllocExNuma
+static LPVOID WINAPI
+CompatVirtualAllocExNuma(HANDLE hProcess,
+                         LPVOID lpAddress,
+                         SIZE_T dwSize,
+                         DWORD  flAllocationType,
+                         DWORD  flProtect,
+                         DWORD  nndPreferred)
+{
+    typedef LPVOID (WINAPI *PFN_VirtualAllocExNuma)(HANDLE, LPVOID, SIZE_T, DWORD, DWORD, DWORD);
+
+    static PFN_VirtualAllocExNuma pVirtualAllocExNuma = NULL;
+    static LONG initState_VAEN = 0;
+
+    if (InterlockedCompareExchange(&initState_VAEN, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pVirtualAllocExNuma = (PFN_VirtualAllocExNuma)
+                GetProcAddress(hKernel32, "VirtualAllocExNuma");
+        }
+        InterlockedExchange(&initState_VAEN, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_VAEN, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pVirtualAllocExNuma != NULL) {
+        return pVirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
+    }
+
+    (void)nndPreferred;
+    return VirtualAllocEx(hProcess, lpAddress, dwSize, flAllocationType, flProtect);
+}
+// end VirtualAllocExNuma
+
+// GetActiveProcessorCount
+static DWORD WINAPI
+CompatGetActiveProcessorCount(WORD GroupNumber)
+{
+    typedef DWORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
+
+    static PFN_GetActiveProcessorCount pGetActiveProcessorCount = NULL;
+    static LONG initState_GAPC = 0;
+
+    if (InterlockedCompareExchange(&initState_GAPC, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetActiveProcessorCount = (PFN_GetActiveProcessorCount)
+                GetProcAddress(hKernel32, "GetActiveProcessorCount");
+        }
+        InterlockedExchange(&initState_GAPC, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GAPC, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetActiveProcessorCount != NULL) {
+        return pGetActiveProcessorCount(GroupNumber);
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupNumber == ALL_PROCESSOR_GROUPS || GroupNumber == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        SetLastError(saved_le);
+        return si.dwNumberOfProcessors;
+    }
+
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return 0;
+}
+// end GetActiveProcessorCount
+
+// GetProcessGroupAffinity
+static BOOL WINAPI
+CompatGetProcessGroupAffinity(HANDLE hProcess, PUSHORT GroupCount, PUSHORT GroupArray)
+{
+    typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT);
+
+    static PFN_GetProcessGroupAffinity pGetProcessGroupAffinity = NULL;
+    static LONG initState_GPGA = 0;
+
+    if (InterlockedCompareExchange(&initState_GPGA, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetProcessGroupAffinity = (PFN_GetProcessGroupAffinity)
+                GetProcAddress(hKernel32, "GetProcessGroupAffinity");
+        }
+        InterlockedExchange(&initState_GPGA, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GPGA, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetProcessGroupAffinity != NULL) {
+        return pGetProcessGroupAffinity(hProcess, GroupCount, GroupArray);
+    }
+
+    (void)hProcess;
+
+    if (GroupCount == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupArray == NULL || *GroupCount < 1) {
+        *GroupCount = 1;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    GroupArray[0] = 0;
+    *GroupCount = 1;
+
+    SetLastError(saved_le);
+    return TRUE;
+}
+// end GetProcessGroupAffinity
+
 #if defined(USE_VECTORED_EXCEPTION_HANDLING)
 PVOID  topLevelVectoredExceptionHandler = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER previousUnhandledExceptionFilter = nullptr;
 #endif
 
 // save DLL module handle, used by GetModuleFileName
-
-// shim for GetActiveProcessorCount
-#ifndef ALL_PROCESSOR_GROUPS
-  #define ALL_PROCESSOR_GROUPS 0xFFFF
-#endif
-
-typedef DWORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
-
-static inline DWORD GetActiveProcessorCount_Runtime(WORD group) {
-  static PFN_GetActiveProcessorCount p =
-      (PFN_GetActiveProcessorCount)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                                  "GetActiveProcessorCount");
-  if (p) {
-    DWORD n = p(group);
-    if (n) return n;  // real API available
-  }
-  // fallback for XP/Vista
-  SYSTEM_INFO si; GetSystemInfo(&si);
-  return si.dwNumberOfProcessors ? si.dwNumberOfProcessors : 1;
-}
-
-// force all calls in this TU to go through the runtime shim
-#ifdef GetActiveProcessorCount
-  #undef GetActiveProcessorCount
-#endif
-#define GetActiveProcessorCount(g) GetActiveProcessorCount_Runtime(g)
-// end shim
-
-// shim for GetProcessGroupAffinity
-#ifndef ALL_PROCESSOR_GROUPS
-  #define ALL_PROCESSOR_GROUPS 0xFFFF
-#endif
-
-typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT);
-
-static inline BOOL GetProcessGroupAffinity_Runtime(HANDLE hProcess,
-                                                   PUSHORT GroupCount,
-                                                   PUSHORT GroupArray) {
-  static PFN_GetProcessGroupAffinity p =
-      (PFN_GetProcessGroupAffinity)GetProcAddress(GetModuleHandleA("kernel32.dll"),
-                                                  "GetProcessGroupAffinity");
-  if (p) {
-    return p(hProcess, GroupCount, GroupArray);
-  }
-
-  // ---- emulate Win7+ contract on XP/Vista (no groups) ----
-  const USHORT required = 1;
-
-  if (GroupArray == nullptr) {
-    if (GroupCount) *GroupCount = required;
-    SetLastError(ERROR_INSUFFICIENT_BUFFER);
-    return FALSE;
-  }
-
-  // caller provided a buffer. if its big enough, fill it with group 0
-  if (GroupCount && *GroupCount >= required) {
-    GroupArray[0] = 0;   // the only group id
-    *GroupCount   = 1;
-    return TRUE;
-  }
-
-  // buffer too small, tell them the required size
-  if (GroupCount) *GroupCount = required;
-  SetLastError(ERROR_INSUFFICIENT_BUFFER);
-  return FALSE;
-}
-
-// force all calls in this TU to go through the runtime shim
-#ifdef GetProcessGroupAffinity
-  #undef GetProcessGroupAffinity
-#endif
-#define GetProcessGroupAffinity(h, gc, ga) GetProcessGroupAffinity_Runtime((h), (gc), (ga))
-// end shim
 
 HINSTANCE vm_lib_handle;
 
@@ -226,6 +415,9 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     }
     WindowsDbgHelp::pre_initialize();
     SymbolEngine::pre_initialize();
+    break;
+  case DLL_THREAD_DETACH:
+    UpcallLinker::on_thread_detach();
     break;
   case DLL_PROCESS_DETACH:
     if (ForceTimeHighResolution) {
@@ -297,7 +489,7 @@ static BOOL virtualFree(LPVOID lpAddress, SIZE_T dwSize, DWORD  dwFreeType) {
 // Logging wrapper for VirtualAllocExNuma
 static LPVOID virtualAllocExNuma(HANDLE hProcess, LPVOID lpAddress, SIZE_T dwSize, DWORD  flAllocationType,
                                  DWORD  flProtect, DWORD  nndPreferred) {
-  LPVOID result = ::VirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
+  LPVOID result = ::CompatVirtualAllocExNuma(hProcess, lpAddress, dwSize, flAllocationType, flProtect, nndPreferred);
   if (result != nullptr) {
     log_trace(os)("VirtualAllocExNuma(" PTR_FORMAT ", " SIZE_FORMAT ", %x, %x, %x) returned " PTR_FORMAT "%s.",
                   p2i(lpAddress), dwSize, flAllocationType, flProtect, nndPreferred, p2i(result),
@@ -994,7 +1186,7 @@ int os::active_processor_count() {
   bool use_process_affinity_mask = false;
   bool got_process_group_affinity = false;
 
-  if (GetProcessGroupAffinity(GetCurrentProcess(), &group_count, nullptr) == 0) {
+  if (CompatGetProcessGroupAffinity(GetCurrentProcess(), &group_count, nullptr) == 0) {
     DWORD last_error = GetLastError();
     if (last_error == ERROR_INSUFFICIENT_BUFFER) {
       if (group_count > 0) {
@@ -1913,7 +2105,7 @@ void os::print_os_info_brief(outputStream* st) {
 }
 
 void os::win32::print_uptime_info(outputStream* st) {
-  unsigned long long ticks = GetTickCount64();
+  unsigned long long ticks = CompatGetTickCount64();
   os::print_dhm(st, "OS uptime:", ticks/1000);
 }
 
@@ -4351,7 +4543,7 @@ void os::win32::initialize_system_info() {
   DWORD processors = 0;
   bool schedules_all_processor_groups = win32::is_windows_11_or_greater() || win32::is_windows_server_2022_or_greater();
   if (schedules_all_processor_groups) {
-    processors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+    processors = CompatGetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
     if (processors == 0) {
       char buf[512];
       size_t buf_len = os::lasterror(buf, sizeof(buf));
@@ -4465,7 +4657,7 @@ int os::win32::exit_process_or_thread(Ept what, int exit_code) {
     bool registered = false;
 
     // The first thread that reached this point, initializes the critical section.
-    if (!InitOnceExecuteOnce(&init_once_crit_sect, init_crit_sect_call, &crit_sect, nullptr)) {
+    if (!CompatInitOnceExecuteOnce(&init_once_crit_sect, init_crit_sect_call, &crit_sect, nullptr)) {
       warning("crit_sect initialization failed in %s: %d\n", __FILE__, __LINE__);
     } else if (Atomic::load_acquire(&process_exiting) == 0) {
       if (what != EPT_THREAD) {
@@ -5865,7 +6057,7 @@ int PlatformMonitor::wait(uint64_t millis) {
   if (millis > UINT_MAX) {
     millis = UINT_MAX;
   }
-  int status = SleepConditionVariableCS(&_cond, &_mutex,
+  int status = CompatSleepConditionVariableCS(&_cond, &_mutex,
                                         millis == 0 ? INFINITE : (DWORD)millis);
   if (status != 0) {
     ret = OS_OK;

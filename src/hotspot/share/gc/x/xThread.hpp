@@ -26,6 +26,7 @@
 
 #include "memory/allStatic.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 
 class XThread : public AllStatic {
   friend class XTask;
@@ -33,12 +34,12 @@ class XThread : public AllStatic {
   friend class XRuntimeWorkersInitializeTask;
 
 private:
-  static THREAD_LOCAL bool      _initialized;
-  static THREAD_LOCAL uintptr_t _id;
-  static THREAD_LOCAL bool      _is_vm;
-  static THREAD_LOCAL bool      _is_java;
-  static THREAD_LOCAL bool      _is_worker;
-  static THREAD_LOCAL uint      _worker_id;
+  static ThreadLocalValue<bool> _initialized;
+  static ThreadLocalValue<uintptr_t> _id;
+  static ThreadLocalValue<bool> _is_vm;
+  static ThreadLocalValue<bool> _is_java;
+  static ThreadLocalValue<bool> _is_worker;
+  static ThreadLocalValue<uint> _worker_id;
 
   static void initialize();
   static void ensure_initialized();

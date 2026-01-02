@@ -36,6 +36,86 @@
 
 #include <Mswsock.h> // Requires Mswsock.lib
 
+// SetFileInformationByHandle
+static BOOL WINAPI
+CompatSetFileInformationByHandle(HANDLE hFile,
+                                 FILE_INFO_BY_HANDLE_CLASS FileInformationClass,
+                                 LPVOID lpFileInformation,
+                                 DWORD dwBufferSize)
+{
+    typedef BOOL (WINAPI *PFN_SetFileInformationByHandle)(HANDLE, FILE_INFO_BY_HANDLE_CLASS, LPVOID, DWORD);
+
+    static PFN_SetFileInformationByHandle pSetFileInformationByHandle = NULL;
+    static LONG initState_SFIBH = 0;
+
+    if (InterlockedCompareExchange(&initState_SFIBH, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pSetFileInformationByHandle = (PFN_SetFileInformationByHandle)
+                GetProcAddress(hKernel32, "SetFileInformationByHandle");
+        }
+        InterlockedExchange(&initState_SFIBH, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_SFIBH, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pSetFileInformationByHandle != NULL) {
+        return pSetFileInformationByHandle(hFile, FileInformationClass, lpFileInformation, dwBufferSize);
+    }
+
+    if (hFile == NULL || hFile == INVALID_HANDLE_VALUE || lpFileInformation == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if (FileInformationClass != FileEndOfFileInfo) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+
+    if (dwBufferSize < (DWORD)sizeof(FILE_END_OF_FILE_INFO)) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    const FILE_END_OF_FILE_INFO* eofInfo = (const FILE_END_OF_FILE_INFO*)lpFileInformation;
+    LARGE_INTEGER newEof = eofInfo->EndOfFile;
+
+    if (newEof.QuadPart < 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    LARGE_INTEGER originalPos;
+    originalPos.QuadPart = 0;
+    if (!SetFilePointerEx(hFile, originalPos, &originalPos, FILE_CURRENT)) {
+        return FALSE;
+    }
+
+    LARGE_INTEGER tmp;
+    if (!SetFilePointerEx(hFile, newEof, &tmp, FILE_BEGIN)) {
+        return FALSE;
+    }
+
+    BOOL ok = SetEndOfFile(hFile);
+    DWORD endErr = ok ? 0 : GetLastError();
+
+    SetFilePointerEx(hFile, originalPos, NULL, FILE_BEGIN);
+
+    if (!ok) {
+        SetLastError(endErr);
+        return FALSE;
+    }
+
+    SetLastError(saved_le);
+    return TRUE;
+}
+// end SetFileInformationByHandle
+
 /**************************************************************
  * FileDispatcherImpl.c
  */
@@ -366,7 +446,7 @@ Java_sun_nio_ch_FileDispatcherImpl_truncate0(JNIEnv *env, jobject this,
     FILE_END_OF_FILE_INFO eofInfo;
 
     eofInfo.EndOfFile.QuadPart = size;
-    result = SetFileInformationByHandle(h,
+    result = CompatSetFileInformationByHandle(h,
                                         FileEndOfFileInfo,
                                         &eofInfo,
                                         sizeof(eofInfo));

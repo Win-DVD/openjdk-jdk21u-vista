@@ -32,6 +32,10 @@
 #include "runtime/javaCalls.hpp"
 #include "runtime/jniHandles.inline.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 #define FOREIGN_ABI "jdk/internal/foreign/abi/"
 
@@ -47,7 +51,7 @@ extern struct JavaVM_ main_vm;
 struct UpcallContext {
   Thread* attachedThread;
 
-  UpcallContext() {} // Explicit constructor to address XL C compiler bug.
+  UpcallContext() : attachedThread(nullptr) {} // Explicit constructor to address XL C compiler bug.
   ~UpcallContext() {
     if (attachedThread != nullptr) {
       JavaVM_ *vm = (JavaVM *)(&main_vm);
@@ -56,7 +60,56 @@ struct UpcallContext {
   }
 };
 
-APPROVED_CPP_THREAD_LOCAL UpcallContext threadContext;
+#if defined(_WIN32)
+static DWORD upcall_tls_index = TLS_OUT_OF_INDEXES;
+static volatile LONG upcall_tls_state = 0;
+
+static void ensure_upcall_tls() {
+  if (upcall_tls_state == 2) {
+    return;
+  }
+  LONG previous = InterlockedCompareExchange(&upcall_tls_state, 1, 0);
+  if (previous == 0) {
+    DWORD index = TlsAlloc();
+    guarantee(index != TLS_OUT_OF_INDEXES, "TlsAlloc failed: out of indices");
+    upcall_tls_index = index;
+    InterlockedExchange(&upcall_tls_state, 2);
+    return;
+  }
+  while (upcall_tls_state != 2) {
+    Sleep(0);
+  }
+}
+
+static UpcallContext* upcall_context() {
+  ensure_upcall_tls();
+  UpcallContext* context = static_cast<UpcallContext*>(TlsGetValue(upcall_tls_index));
+  if (context == nullptr) {
+    context = new UpcallContext();
+    BOOL ok = TlsSetValue(upcall_tls_index, context);
+    assert(ok, "TlsSetValue failed with error code: %lu", GetLastError());
+  }
+  return context;
+}
+
+static void release_upcall_context() {
+  if (upcall_tls_state != 2) {
+    return;
+  }
+  UpcallContext* context = static_cast<UpcallContext*>(TlsGetValue(upcall_tls_index));
+  if (context == nullptr) {
+    return;
+  }
+  TlsSetValue(upcall_tls_index, nullptr);
+  delete context;
+}
+#else
+static ThreadLocalValue<UpcallContext> threadContext;
+
+static UpcallContext* upcall_context() {
+  return &threadContext.value();
+}
+#endif
 
 JavaThread* UpcallLinker::maybe_attach_and_get_thread() {
   JavaThread* thread = JavaThread::current_or_null();
@@ -66,7 +119,7 @@ JavaThread* UpcallLinker::maybe_attach_and_get_thread() {
     jint result = vm->functions->AttachCurrentThreadAsDaemon(vm, (void**) &p_env, nullptr);
     guarantee(result == JNI_OK, "Could not attach thread for upcall. JNI error code: %d", result);
     thread = JavaThread::current();
-    threadContext.attachedThread = thread;
+    upcall_context()->attachedThread = thread;
     assert(!thread->has_last_Java_frame(), "newly-attached thread not expected to have last Java frame");
   }
   return thread;
@@ -138,6 +191,12 @@ void UpcallLinker::handle_uncaught_exception(oop exception) {
   exception->print();
   ShouldNotReachHere();
 }
+
+#if defined(_WIN32)
+void UpcallLinker::on_thread_detach() {
+  release_upcall_context();
+}
+#endif
 
 JVM_ENTRY(jlong, UL_MakeUpcallStub(JNIEnv *env, jclass unused, jobject mh, jobject abi, jobject conv,
                                                  jboolean needs_return_buffer, jlong ret_buf_size))

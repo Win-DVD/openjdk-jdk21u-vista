@@ -29,6 +29,174 @@
 #include <shlobj.h>
 #include <sun_awt_windows_WClipboard.h>
 
+// AddClipboardFormatListener
+static BOOL WINAPI
+CompatAddClipboardFormatListener(HWND hwnd)
+{
+    typedef BOOL (WINAPI *PFN_AddClipboardFormatListener)(HWND);
+
+    static PFN_AddClipboardFormatListener pAddClipboardFormatListener = NULL;
+    static LONG initState_ACFL = 0;
+
+    if (InterlockedCompareExchange(&initState_ACFL, 1, 0) == 0) {
+        HMODULE hUser32 = GetModuleHandle(TEXT("USER32.DLL"));
+        if (hUser32) {
+            pAddClipboardFormatListener = (PFN_AddClipboardFormatListener)
+                GetProcAddress(hUser32, "AddClipboardFormatListener");
+        }
+        InterlockedExchange(&initState_ACFL, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_ACFL, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pAddClipboardFormatListener != NULL) {
+        return pAddClipboardFormatListener(hwnd);
+    }
+
+    if (hwnd == NULL) {
+        SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    if (SetClipboardViewer(hwnd) == NULL) {
+        DWORD le = GetLastError();
+        if (le == 0) {
+            SetLastError(ERROR_GEN_FAILURE);
+        }
+        return FALSE;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+// end AddClipboardFormatListener
+
+// RemoveClipboardFormatListener
+static BOOL WINAPI
+CompatRemoveClipboardFormatListener(HWND hwnd)
+{
+    typedef BOOL (WINAPI *PFN_RemoveClipboardFormatListener)(HWND);
+
+    static PFN_RemoveClipboardFormatListener pRemoveClipboardFormatListener = NULL;
+    static LONG initState_RCFL = 0;
+
+    if (InterlockedCompareExchange(&initState_RCFL, 1, 0) == 0) {
+        HMODULE hUser32 = GetModuleHandle(TEXT("USER32.DLL"));
+        if (hUser32) {
+            pRemoveClipboardFormatListener = (PFN_RemoveClipboardFormatListener)
+                GetProcAddress(hUser32, "RemoveClipboardFormatListener");
+        }
+        InterlockedExchange(&initState_RCFL, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_RCFL, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pRemoveClipboardFormatListener != NULL) {
+        return pRemoveClipboardFormatListener(hwnd);
+    }
+
+    if (hwnd == NULL) {
+        SetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    if (!ChangeClipboardChain(hwnd, NULL)) {
+        DWORD le = GetLastError();
+        if (le == 0) {
+            SetLastError(ERROR_GEN_FAILURE);
+        }
+        return FALSE;
+    }
+
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+// end RemoveClipboardFormatListener
+
+// GetUpdatedClipboardFormats
+static BOOL WINAPI
+CompatGetUpdatedClipboardFormats(PUINT lpuiFormats,
+                                 UINT cFormats,
+                                 PUINT pcFormatsOut)
+{
+    typedef BOOL (WINAPI *PFN_GetUpdatedClipboardFormats)(PUINT, UINT, PUINT);
+
+    static PFN_GetUpdatedClipboardFormats pGetUpdatedClipboardFormats = NULL;
+    static LONG initState_GUCF = 0;
+
+    if (InterlockedCompareExchange(&initState_GUCF, 1, 0) == 0) {
+        HMODULE hUser32 = GetModuleHandle(TEXT("USER32.DLL"));
+        if (hUser32) {
+            pGetUpdatedClipboardFormats = (PFN_GetUpdatedClipboardFormats)
+                GetProcAddress(hUser32, "GetUpdatedClipboardFormats");
+        }
+        InterlockedExchange(&initState_GUCF, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GUCF, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetUpdatedClipboardFormats != NULL) {
+        return pGetUpdatedClipboardFormats(lpuiFormats, cFormats, pcFormatsOut);
+    }
+
+    if (pcFormatsOut == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    *pcFormatsOut = 0;
+
+    if (lpuiFormats == NULL || cFormats == 0) {
+        UINT count = 0;
+        UINT fmt = 0;
+
+        fmt = EnumClipboardFormats(0);
+        while (fmt != 0) {
+            count++;
+            fmt = EnumClipboardFormats(fmt);
+        }
+
+        if (GetLastError() != ERROR_SUCCESS) {
+            return FALSE;
+        }
+
+        *pcFormatsOut = count;
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    UINT out = 0;
+    UINT fmt = EnumClipboardFormats(0);
+
+    while (fmt != 0) {
+        if (out < cFormats) {
+            lpuiFormats[out] = fmt;
+            out++;
+        } else {
+            *pcFormatsOut = out + 1;
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+
+        fmt = EnumClipboardFormats(fmt);
+    }
+
+    if (GetLastError() != ERROR_SUCCESS) {
+        return FALSE;
+    }
+
+    *pcFormatsOut = out;
+    SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+// end GetUpdatedClipboardFormats
+
 
 /************************************************************************
  * AwtClipboard fields
@@ -77,7 +245,7 @@ void AwtClipboard::RegisterClipboardViewer(JNIEnv *env, jobject jclipboard) {
             env->GetMethodID(cls, "handleContentsChanged", "()V");
     DASSERT(AwtClipboard::handleContentsChangedMID != NULL);
 
-    ::AddClipboardFormatListener(AwtToolkit::GetInstance().GetHWnd());
+    ::CompatAddClipboardFormatListener(AwtToolkit::GetInstance().GetHWnd());
     isClipboardViewerRegistered = TRUE;
 }
 
@@ -85,7 +253,7 @@ void AwtClipboard::UnregisterClipboardViewer(JNIEnv *env) {
     TRY;
 
     if (isClipboardViewerRegistered) {
-        ::RemoveClipboardFormatListener(AwtToolkit::GetInstance().GetHWnd());
+        ::CompatRemoveClipboardFormatListener(AwtToolkit::GetInstance().GetHWnd());
         isClipboardViewerRegistered = FALSE;
     }
 
@@ -298,7 +466,7 @@ Java_sun_awt_windows_WClipboard_getClipboardFormats
     unsigned int pcFormatsOut = 0;
     unsigned int lpuiFormats[128] = { 0 };
 
-    VERIFY(::GetUpdatedClipboardFormats(lpuiFormats, 128, &pcFormatsOut));
+    VERIFY(::CompatGetUpdatedClipboardFormats(lpuiFormats, 128, &pcFormatsOut));
 
     jlongArray formats = env->NewLongArray(pcFormatsOut);
     if (formats == NULL) {
