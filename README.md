@@ -32,5 +32,5 @@ There may be a workaround to get it launched (I was able to get it to work somet
 If you need to contact me for any reason, my Discord server is your best bet.
 
 - **My website**: https://win-games.uk/
-- **My Discord**: https://discord.gg/xZyz6WTfaT
+- **My Discord**: https://discord.gg/KMAq2mVaXp
 - **My email**: windvd@win-games.uk
