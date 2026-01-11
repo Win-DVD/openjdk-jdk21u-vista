@@ -433,79 +433,201 @@ CompatGetQueuedCompletionStatusEx(HANDLE CompletionPort,
 
 // SRW Lock stuff
 
-static CRITICAL_SECTION*
-Compat__GetOrCreateSrwCs(PSRWLOCK SRWLock)
+typedef struct CompatSrwFallbackLock
 {
-    CRITICAL_SECTION* cs =
-        (CRITICAL_SECTION*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
-    if (cs != NULL) {
-        return cs;
-    }
+	CRITICAL_SECTION cs;
+	HANDLE semReaders;
+	HANDLE semWriters;
+	LONG readers;
+	LONG waitingReaders;
+	LONG waitingWriters;
+	LONG writerActive;
+} CompatSrwFallbackLock;
 
-    CRITICAL_SECTION* ncs = (CRITICAL_SECTION*)malloc(sizeof(*ncs));
-    if (ncs == NULL) {
-        return NULL;
-    }
+static CompatSrwFallbackLock*
+Compat__GetOrCreateSrwState(PSRWLOCK SRWLock)
+{
+	CompatSrwFallbackLock* st =
+		(CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+	if (st != NULL) {
+		return st;
+	}
 
-    InitializeCriticalSection(ncs);
+	CompatSrwFallbackLock* nst = (CompatSrwFallbackLock*)malloc(sizeof(*nst));
+	if (nst == NULL) {
+		return NULL;
+	}
 
-    if (InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, (PVOID)ncs, NULL) != NULL) {
-        /* someone else won */
-        DeleteCriticalSection(ncs);
-        free(ncs);
-    }
+	ZeroMemory(nst, sizeof(*nst));
 
-    return (CRITICAL_SECTION*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+	InitializeCriticalSection(&nst->cs);
+
+	nst->semReaders = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+	nst->semWriters = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+
+	if (nst->semReaders == NULL || nst->semWriters == NULL) {
+		if (nst->semReaders) CloseHandle(nst->semReaders);
+		if (nst->semWriters) CloseHandle(nst->semWriters);
+		DeleteCriticalSection(&nst->cs);
+		free(nst);
+		return NULL;
+	}
+
+	if (InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, (PVOID)nst, NULL) != NULL) {
+		CloseHandle(nst->semReaders);
+		CloseHandle(nst->semWriters);
+		DeleteCriticalSection(&nst->cs);
+		free(nst);
+	}
+
+	return (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
 }
 
-static CRITICAL_SECTION*
-Compat__GetGlobalSrwFallbackCs(void)
+static CompatSrwFallbackLock*
+Compat__GetGlobalSrwFallbackState(void)
 {
-    static CRITICAL_SECTION g_srwCs;
-    static LONG initState_SRWCS = 0;
+	static CompatSrwFallbackLock g_srw;
+	static LONG initState_SRWCS = 0;
 
-    if (InterlockedCompareExchange(&initState_SRWCS, 1, 0) == 0) {
-        InitializeCriticalSection(&g_srwCs);
-        InterlockedExchange(&initState_SRWCS, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_SRWCS, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_SRWCS, 1, 0) == 0) {
+		ZeroMemory(&g_srw, sizeof(g_srw));
+		InitializeCriticalSection(&g_srw.cs);
+		g_srw.semReaders = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+		g_srw.semWriters = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+		InterlockedExchange(&initState_SRWCS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_SRWCS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    return &g_srwCs;
+	return &g_srw;
+}
+
+static VOID
+Compat__FallbackAcquireExclusive(CompatSrwFallbackLock* st)
+{
+	EnterCriticalSection(&st->cs);
+	if (st->writerActive == 0 && st->readers == 0) {
+		st->writerActive = 1;
+		LeaveCriticalSection(&st->cs);
+		return;
+	}
+
+	st->waitingWriters++;
+	LeaveCriticalSection(&st->cs);
+
+	WaitForSingleObject(st->semWriters, INFINITE);
+}
+
+static VOID
+Compat__FallbackReleaseExclusive(CompatSrwFallbackLock* st)
+{
+	LONG n;
+
+	EnterCriticalSection(&st->cs);
+
+	st->writerActive = 0;
+
+	if (st->waitingWriters > 0) {
+		st->writerActive = 1;
+		st->waitingWriters--;
+		LeaveCriticalSection(&st->cs);
+		ReleaseSemaphore(st->semWriters, 1, NULL);
+		return;
+	}
+
+	if (st->waitingReaders > 0) {
+		n = st->waitingReaders;
+		st->waitingReaders = 0;
+		st->readers = n;
+		LeaveCriticalSection(&st->cs);
+		ReleaseSemaphore(st->semReaders, n, NULL);
+		return;
+	}
+
+	LeaveCriticalSection(&st->cs);
+}
+
+static VOID
+Compat__FallbackAcquireShared(CompatSrwFallbackLock* st)
+{
+	EnterCriticalSection(&st->cs);
+	if (st->writerActive == 0 && st->waitingWriters == 0) {
+		st->readers++;
+		LeaveCriticalSection(&st->cs);
+		return;
+	}
+
+	st->waitingReaders++;
+	LeaveCriticalSection(&st->cs);
+
+	WaitForSingleObject(st->semReaders, INFINITE);
+}
+
+static VOID
+Compat__FallbackReleaseShared(CompatSrwFallbackLock* st)
+{
+	LONG n;
+
+	EnterCriticalSection(&st->cs);
+
+	st->readers--;
+
+	if (st->readers == 0) {
+		if (st->waitingWriters > 0) {
+			st->writerActive = 1;
+			st->waitingWriters--;
+			LeaveCriticalSection(&st->cs);
+			ReleaseSemaphore(st->semWriters, 1, NULL);
+			return;
+		}
+
+		if (st->waitingReaders > 0) {
+			n = st->waitingReaders;
+			st->waitingReaders = 0;
+			st->readers = n;
+			LeaveCriticalSection(&st->cs);
+			ReleaseSemaphore(st->semReaders, n, NULL);
+			return;
+		}
+	}
+
+	LeaveCriticalSection(&st->cs);
 }
 
 // InitializeSRWLock
 static VOID WINAPI
 CompatInitializeSRWLock(PSRWLOCK SRWLock)
 {
-    typedef VOID (WINAPI *PFN_InitializeSRWLock)(PSRWLOCK);
+	typedef VOID(WINAPI *PFN_InitializeSRWLock)(PSRWLOCK);
 
-    static PFN_InitializeSRWLock pInitializeSRWLock = NULL;
-    static LONG initState_ISRW = 0;
+	static PFN_InitializeSRWLock pInitializeSRWLock = NULL;
+	static LONG initState_ISRW = 0;
 
-    if (InterlockedCompareExchange(&initState_ISRW, 1, 0) == 0) {
-        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
-        if (hKernel32) {
-            pInitializeSRWLock = (PFN_InitializeSRWLock)
-                GetProcAddress(hKernel32, "InitializeSRWLock");
-        }
-        InterlockedExchange(&initState_ISRW, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_ISRW, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_ISRW, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pInitializeSRWLock = (PFN_InitializeSRWLock)
+				GetProcAddress(hKernel32, "InitializeSRWLock");
+		}
+		InterlockedExchange(&initState_ISRW, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ISRW, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    if (pInitializeSRWLock != NULL) {
-        pInitializeSRWLock(SRWLock);
-        return;
-    }
+	if (pInitializeSRWLock != NULL) {
+		pInitializeSRWLock(SRWLock);
+		return;
+	}
 
-    if (SRWLock != NULL) {
-        InterlockedExchangePointer((PVOID*)&SRWLock->Ptr, NULL);
-    }
+	if (SRWLock != NULL) {
+		InterlockedExchangePointer((PVOID*)&SRWLock->Ptr, NULL);
+	}
 }
 // end InitializeSRWLock
 
@@ -513,42 +635,44 @@ CompatInitializeSRWLock(PSRWLOCK SRWLock)
 static VOID WINAPI
 CompatAcquireSRWLockExclusive(PSRWLOCK SRWLock)
 {
-    typedef VOID (WINAPI *PFN_AcquireSRWLockExclusive)(PSRWLOCK);
+	typedef VOID(WINAPI *PFN_AcquireSRWLockExclusive)(PSRWLOCK);
 
-    static PFN_AcquireSRWLockExclusive pAcquireSRWLockExclusive = NULL;
-    static LONG initState_ASRWX = 0;
+	static PFN_AcquireSRWLockExclusive pAcquireSRWLockExclusive = NULL;
+	static LONG initState_ASRWX = 0;
 
-    if (InterlockedCompareExchange(&initState_ASRWX, 1, 0) == 0) {
-        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
-        if (hKernel32) {
-            pAcquireSRWLockExclusive = (PFN_AcquireSRWLockExclusive)
-                GetProcAddress(hKernel32, "AcquireSRWLockExclusive");
-        }
-        InterlockedExchange(&initState_ASRWX, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_ASRWX, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_ASRWX, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pAcquireSRWLockExclusive = (PFN_AcquireSRWLockExclusive)
+				GetProcAddress(hKernel32, "AcquireSRWLockExclusive");
+		}
+		InterlockedExchange(&initState_ASRWX, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ASRWX, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    if (pAcquireSRWLockExclusive != NULL) {
-        pAcquireSRWLockExclusive(SRWLock);
-        return;
-    }
+	if (pAcquireSRWLockExclusive != NULL) {
+		pAcquireSRWLockExclusive(SRWLock);
+		return;
+	}
 
-    DWORD saved_le = GetLastError();
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
 
-    if (SRWLock != NULL) {
-        CRITICAL_SECTION* cs = Compat__GetOrCreateSrwCs(SRWLock);
-        if (cs != NULL) {
-            EnterCriticalSection(cs);
-            SetLastError(saved_le);
-            return;
-        }
-    }
+		if (SRWLock != NULL) {
+			st = Compat__GetOrCreateSrwState(SRWLock);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
 
-    EnterCriticalSection(Compat__GetGlobalSrwFallbackCs());
-    SetLastError(saved_le);
+		Compat__FallbackAcquireExclusive(st);
+		SetLastError(saved_le);
+	}
 }
 // end AcquireSRWLockExclusive
 
@@ -556,43 +680,44 @@ CompatAcquireSRWLockExclusive(PSRWLOCK SRWLock)
 static VOID WINAPI
 CompatReleaseSRWLockExclusive(PSRWLOCK SRWLock)
 {
-    typedef VOID (WINAPI *PFN_ReleaseSRWLockExclusive)(PSRWLOCK);
+	typedef VOID(WINAPI *PFN_ReleaseSRWLockExclusive)(PSRWLOCK);
 
-    static PFN_ReleaseSRWLockExclusive pReleaseSRWLockExclusive = NULL;
-    static LONG initState_RSRWX = 0;
+	static PFN_ReleaseSRWLockExclusive pReleaseSRWLockExclusive = NULL;
+	static LONG initState_RSRWX = 0;
 
-    if (InterlockedCompareExchange(&initState_RSRWX, 1, 0) == 0) {
-        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
-        if (hKernel32) {
-            pReleaseSRWLockExclusive = (PFN_ReleaseSRWLockExclusive)
-                GetProcAddress(hKernel32, "ReleaseSRWLockExclusive");
-        }
-        InterlockedExchange(&initState_RSRWX, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_RSRWX, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_RSRWX, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pReleaseSRWLockExclusive = (PFN_ReleaseSRWLockExclusive)
+				GetProcAddress(hKernel32, "ReleaseSRWLockExclusive");
+		}
+		InterlockedExchange(&initState_RSRWX, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_RSRWX, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    if (pReleaseSRWLockExclusive != NULL) {
-        pReleaseSRWLockExclusive(SRWLock);
-        return;
-    }
+	if (pReleaseSRWLockExclusive != NULL) {
+		pReleaseSRWLockExclusive(SRWLock);
+		return;
+	}
 
-    DWORD saved_le = GetLastError();
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
 
-    if (SRWLock != NULL) {
-        CRITICAL_SECTION* cs =
-            (CRITICAL_SECTION*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
-        if (cs != NULL) {
-            LeaveCriticalSection(cs);
-            SetLastError(saved_le);
-            return;
-        }
-    }
+		if (SRWLock != NULL) {
+			st = (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
 
-    LeaveCriticalSection(Compat__GetGlobalSrwFallbackCs());
-    SetLastError(saved_le);
+		Compat__FallbackReleaseExclusive(st);
+		SetLastError(saved_le);
+	}
 }
 // end ReleaseSRWLockExclusive
 
@@ -600,42 +725,44 @@ CompatReleaseSRWLockExclusive(PSRWLOCK SRWLock)
 static VOID WINAPI
 CompatAcquireSRWLockShared(PSRWLOCK SRWLock)
 {
-    typedef VOID (WINAPI *PFN_AcquireSRWLockShared)(PSRWLOCK);
+	typedef VOID(WINAPI *PFN_AcquireSRWLockShared)(PSRWLOCK);
 
-    static PFN_AcquireSRWLockShared pAcquireSRWLockShared = NULL;
-    static LONG initState_ASRWS = 0;
+	static PFN_AcquireSRWLockShared pAcquireSRWLockShared = NULL;
+	static LONG initState_ASRWS = 0;
 
-    if (InterlockedCompareExchange(&initState_ASRWS, 1, 0) == 0) {
-        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
-        if (hKernel32) {
-            pAcquireSRWLockShared = (PFN_AcquireSRWLockShared)
-                GetProcAddress(hKernel32, "AcquireSRWLockShared");
-        }
-        InterlockedExchange(&initState_ASRWS, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_ASRWS, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_ASRWS, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pAcquireSRWLockShared = (PFN_AcquireSRWLockShared)
+				GetProcAddress(hKernel32, "AcquireSRWLockShared");
+		}
+		InterlockedExchange(&initState_ASRWS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ASRWS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    if (pAcquireSRWLockShared != NULL) {
-        pAcquireSRWLockShared(SRWLock);
-        return;
-    }
+	if (pAcquireSRWLockShared != NULL) {
+		pAcquireSRWLockShared(SRWLock);
+		return;
+	}
 
-    DWORD saved_le = GetLastError();
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
 
-    if (SRWLock != NULL) {
-        CRITICAL_SECTION* cs = Compat__GetOrCreateSrwCs(SRWLock);
-        if (cs != NULL) {
-            EnterCriticalSection(cs);
-            SetLastError(saved_le);
-            return;
-        }
-    }
+		if (SRWLock != NULL) {
+			st = Compat__GetOrCreateSrwState(SRWLock);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
 
-    EnterCriticalSection(Compat__GetGlobalSrwFallbackCs());
-    SetLastError(saved_le);
+		Compat__FallbackAcquireShared(st);
+		SetLastError(saved_le);
+	}
 }
 // end AcquireSRWLockShared
 
@@ -643,43 +770,44 @@ CompatAcquireSRWLockShared(PSRWLOCK SRWLock)
 static VOID WINAPI
 CompatReleaseSRWLockShared(PSRWLOCK SRWLock)
 {
-    typedef VOID (WINAPI *PFN_ReleaseSRWLockShared)(PSRWLOCK);
+	typedef VOID(WINAPI *PFN_ReleaseSRWLockShared)(PSRWLOCK);
 
-    static PFN_ReleaseSRWLockShared pReleaseSRWLockShared = NULL;
-    static LONG initState_RSRWS = 0;
+	static PFN_ReleaseSRWLockShared pReleaseSRWLockShared = NULL;
+	static LONG initState_RSRWS = 0;
 
-    if (InterlockedCompareExchange(&initState_RSRWS, 1, 0) == 0) {
-        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
-        if (hKernel32) {
-            pReleaseSRWLockShared = (PFN_ReleaseSRWLockShared)
-                GetProcAddress(hKernel32, "ReleaseSRWLockShared");
-        }
-        InterlockedExchange(&initState_RSRWS, 2);
-    } else {
-        while (InterlockedCompareExchange(&initState_RSRWS, 2, 2) != 2) {
-            SwitchToThread();
-        }
-    }
+	if (InterlockedCompareExchange(&initState_RSRWS, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pReleaseSRWLockShared = (PFN_ReleaseSRWLockShared)
+				GetProcAddress(hKernel32, "ReleaseSRWLockShared");
+		}
+		InterlockedExchange(&initState_RSRWS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_RSRWS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
 
-    if (pReleaseSRWLockShared != NULL) {
-        pReleaseSRWLockShared(SRWLock);
-        return;
-    }
+	if (pReleaseSRWLockShared != NULL) {
+		pReleaseSRWLockShared(SRWLock);
+		return;
+	}
 
-    DWORD saved_le = GetLastError();
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
 
-    if (SRWLock != NULL) {
-        CRITICAL_SECTION* cs =
-            (CRITICAL_SECTION*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
-        if (cs != NULL) {
-            LeaveCriticalSection(cs);
-            SetLastError(saved_le);
-            return;
-        }
-    }
+		if (SRWLock != NULL) {
+			st = (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
 
-    LeaveCriticalSection(Compat__GetGlobalSrwFallbackCs());
-    SetLastError(saved_le);
+		Compat__FallbackReleaseShared(st);
+		SetLastError(saved_le);
+	}
 }
 // end ReleaseSRWLockShared
 // end SRW lock stuff
