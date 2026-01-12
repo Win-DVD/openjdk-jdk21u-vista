@@ -16,7 +16,7 @@ Compatibility is not guaranteed with the extended kernel installed.
 ------------------------------------
 *SPECIFIC INFORMATION TO XP
 
-Compiling for Windows XP is a bit complicated and hacky.<br>
+Compiling for Windows XP is a bit complicated and hacky. It will also require SP2 or higher due to MSVC 2017 compiler.<br>
 After compiling, You must patch the subsystem version to 5.0 for x86 or 5.2 for x64 instead of the default 6.0 subsystem post build.<br>
 You must also obtain a UCRTBASE.dll that is compatible with XP post build.<br>
 The release builds already have this work completed.<br>
