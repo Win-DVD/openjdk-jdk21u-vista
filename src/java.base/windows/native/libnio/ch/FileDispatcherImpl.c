@@ -116,6 +116,156 @@ CompatSetFileInformationByHandle(HANDLE hFile,
 }
 // end SetFileInformationByHandle
 
+// ReOpenFile
+
+typedef struct {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+} ROF_UNICODE_STRING;
+
+typedef struct {
+    ROF_UNICODE_STRING Name;
+    WCHAR              NameBuffer[4096];
+} ROF_OBJECT_NAME_INFORMATION;
+
+static BOOL
+CompatROFNtPathToWin32(LPCWSTR ntPath, LPWSTR outBuf, DWORD cchOut)
+{
+    WCHAR driveStrings[128];
+    WCHAR devPath[MAX_PATH + 1];
+    WCHAR drv[3];
+    size_t devLen, tail;
+
+    drv[1] = L':';
+    drv[2] = 0;
+
+    if (GetLogicalDriveStringsW((sizeof(driveStrings) / sizeof(WCHAR)) - 1, driveStrings) > 0) {
+        LPCWSTR p = driveStrings;
+        while (*p) {
+            drv[0] = p[0];
+            if (QueryDosDeviceW(drv, devPath, MAX_PATH)) {
+                devLen = wcslen(devPath);
+                if (_wcsnicmp(ntPath, devPath, devLen) == 0 &&
+                    (ntPath[devLen] == L'\\' || ntPath[devLen] == 0)) {
+                    tail = wcslen(ntPath + devLen);
+                    if ((size_t)cchOut < 2 + tail + 1) {
+                        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+                        return FALSE;
+                    }
+                    outBuf[0] = p[0];
+                    outBuf[1] = L':';
+                    wcsncpy(outBuf + 2, ntPath + devLen, tail + 1);
+                    return TRUE;
+                }
+            }
+            p += wcslen(p) + 1;
+        }
+    }
+
+    if (_wcsnicmp(ntPath, L"\\Device\\Mup\\", 12) == 0) {
+        tail = wcslen(ntPath + 12);
+        if ((size_t)cchOut < 2 + tail + 1) {
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        outBuf[0] = L'\\';
+        outBuf[1] = L'\\';
+        wcsncpy(outBuf + 2, ntPath + 12, tail + 1);
+        return TRUE;
+    }
+
+    SetLastError(ERROR_FILE_NOT_FOUND);
+    return FALSE;
+}
+
+static HANDLE WINAPI
+CompatReOpenFile(HANDLE hOriginalFile,
+                 DWORD  dwDesiredAccess,
+                 DWORD  dwShareMode,
+                 DWORD  dwFlagsAndAttributes)
+{
+    typedef HANDLE (WINAPI *PFN_ReOpenFile)(HANDLE, DWORD, DWORD, DWORD);
+    typedef LONG   (NTAPI *PFN_NtQueryObject)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+    static PFN_ReOpenFile pReOpenFile = NULL;
+    static LONG initState_ROF = 0;
+
+    if (InterlockedCompareExchange(&initState_ROF, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pReOpenFile = (PFN_ReOpenFile)
+                GetProcAddress(hKernel32, "ReOpenFile");
+        }
+        InterlockedExchange(&initState_ROF, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_ROF, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pReOpenFile != NULL) {
+        return pReOpenFile(hOriginalFile, dwDesiredAccess, dwShareMode, dwFlagsAndAttributes);
+    }
+
+    if (hOriginalFile == NULL || hOriginalFile == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    {
+        HMODULE hNtdll;
+        PFN_NtQueryObject pNtQueryObject;
+        ROF_OBJECT_NAME_INFORMATION oni;
+        ULONG retLen;
+        LONG status;
+        WCHAR win32Path[MAX_PATH + 8];
+        DWORD createFlags;
+
+        hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (!hNtdll) {
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        pNtQueryObject = (PFN_NtQueryObject)
+            GetProcAddress(hNtdll, "NtQueryObject");
+        if (!pNtQueryObject) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        ZeroMemory(&oni.Name, sizeof(oni.Name));
+        retLen = 0;
+        status = pNtQueryObject(hOriginalFile, 1, &oni, sizeof(oni), &retLen);
+        if (status != 0 || oni.Name.Buffer == NULL || oni.Name.Length == 0) {
+            SetLastError(ERROR_INVALID_HANDLE);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        oni.Name.Buffer[oni.Name.Length / sizeof(WCHAR)] = 0;
+
+        if (!CompatROFNtPathToWin32(oni.Name.Buffer, win32Path,
+                                    sizeof(win32Path) / sizeof(WCHAR))) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        createFlags = dwFlagsAndAttributes;
+        if ((createFlags & 0x0000FFFFUL) == 0) {
+            createFlags |= FILE_ATTRIBUTE_NORMAL;
+        }
+
+        return CreateFileW(win32Path,
+                           dwDesiredAccess,
+                           dwShareMode,
+                           NULL,
+                           OPEN_EXISTING,
+                           createFlags,
+                           NULL);
+    }
+}
+// end ReOpenFile
+
 /**************************************************************
  * FileDispatcherImpl.c
  */
@@ -740,7 +890,7 @@ Java_sun_nio_ch_FileDispatcherImpl_setDirect0(JNIEnv *env, jclass this,
 
     HANDLE orig = (HANDLE)(handleval(env, fdObj));
 
-    HANDLE modify = ReOpenFile(orig, 0, 0,
+    HANDLE modify = CompatReOpenFile(orig, 0, 0,
             FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH);
 
     if (modify != INVALID_HANDLE_VALUE) {

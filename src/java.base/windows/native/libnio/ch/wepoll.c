@@ -812,6 +812,65 @@ CompatReleaseSRWLockShared(PSRWLOCK SRWLock)
 // end ReleaseSRWLockShared
 // end SRW lock stuff
 
+// SetFileCompletionNotificationModes
+static BOOL WINAPI
+CompatSetFileCompletionNotificationModes(HANDLE FileHandle, UCHAR Flags)
+{
+    typedef BOOL (WINAPI *PFN_SetFileCompletionNotificationModes)(HANDLE, UCHAR);
+    typedef LONG (NTAPI *PFN_NtSetInformationFile)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+
+    static PFN_SetFileCompletionNotificationModes pSetFileCompletionNotificationModes = NULL;
+    static LONG initState_SFCNM = 0;
+
+    if (InterlockedCompareExchange(&initState_SFCNM, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pSetFileCompletionNotificationModes = (PFN_SetFileCompletionNotificationModes)
+                GetProcAddress(hKernel32, "SetFileCompletionNotificationModes");
+        }
+        InterlockedExchange(&initState_SFCNM, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_SFCNM, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pSetFileCompletionNotificationModes != NULL) {
+        return pSetFileCompletionNotificationModes(FileHandle, Flags);
+    }
+
+    if (FileHandle == NULL || FileHandle == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    {
+        HMODULE hNtdll;
+        PFN_NtSetInformationFile pNtSetInformationFile;
+        struct { ULONG Flags; } sfcnm_info;
+        struct { ULONG_PTR Status; ULONG_PTR Information; } sfcnm_iosb;
+        LONG status;
+
+        hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (hNtdll) {
+            pNtSetInformationFile = (PFN_NtSetInformationFile)
+                GetProcAddress(hNtdll, "NtSetInformationFile");
+            if (pNtSetInformationFile) {
+                sfcnm_info.Flags = (ULONG)Flags;
+                ZeroMemory(&sfcnm_iosb, sizeof(sfcnm_iosb));
+                status = pNtSetInformationFile(FileHandle, &sfcnm_iosb,
+                                               &sfcnm_info, sizeof(sfcnm_info), 41);
+                if (status == 0) {
+                    return TRUE;
+                }
+            }
+        }
+    }
+
+    return TRUE;
+}
+// end SetFileCompletionNotificationModes
+
 typedef struct _IO_STATUS_BLOCK {
   NTSTATUS Status;
   ULONG_PTR Information;
@@ -1000,7 +1059,7 @@ int afd_create_device_handle(HANDLE iocp_handle,
   if (CreateIoCompletionPort(afd_device_handle, iocp_handle, 0, 0) == NULL)
     goto error;
 
-  if (!SetFileCompletionNotificationModes(afd_device_handle,
+  if (!CompatSetFileCompletionNotificationModes(afd_device_handle,
                                           FILE_SKIP_SET_EVENT_ON_HANDLE))
     goto error;
 

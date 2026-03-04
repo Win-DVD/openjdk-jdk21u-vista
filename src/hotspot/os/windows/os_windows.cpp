@@ -397,6 +397,36 @@ CompatGetProcessGroupAffinity(HANDLE hProcess, PUSHORT GroupCount, PUSHORT Group
 }
 // end GetProcessGroupAffinity
 
+// GetLargePageMinimum
+static SIZE_T WINAPI
+CompatGetLargePageMinimum(void)
+{
+    typedef SIZE_T (WINAPI *PFN_GetLargePageMinimum)(void);
+
+    static PFN_GetLargePageMinimum pGetLargePageMinimum = NULL;
+    static LONG initState_GLPM = 0;
+
+    if (InterlockedCompareExchange(&initState_GLPM, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetLargePageMinimum = (PFN_GetLargePageMinimum)
+                GetProcAddress(hKernel32, "GetLargePageMinimum");
+        }
+        InterlockedExchange(&initState_GLPM, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GLPM, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetLargePageMinimum != NULL) {
+        return pGetLargePageMinimum();
+    }
+
+    return (SIZE_T)(*(volatile ULONG *)((ULONG_PTR)0x7FFE0000 + 0x244));
+}
+// end GetLargePageMinimum
+
 #if defined(USE_VECTORED_EXCEPTION_HANDLING)
 PVOID  topLevelVectoredExceptionHandler = nullptr;
 LPTOP_LEVEL_EXCEPTION_FILTER previousUnhandledExceptionFilter = nullptr;
@@ -3546,7 +3576,7 @@ size_t os::win32::large_page_init_decide_size() {
     return 0;
   }
 
-  size_t size = GetLargePageMinimum();
+  size_t size = CompatGetLargePageMinimum();
   if (size == 0) {
     WARN("Large page is not supported by the processor.");
     return 0;
@@ -3589,7 +3619,7 @@ void os::large_page_init() {
   if (_large_page_size > default_page_size) {
 #if !defined(IA32)
     if (EnableAllLargePageSizesForWindows) {
-      size_t min_size = GetLargePageMinimum();
+      size_t min_size = CompatGetLargePageMinimum();
 
       // Populate _page_sizes with large page sizes less than or equal to _large_page_size, ensuring each page size is double the size of the previous one.
       for (size_t page_size = min_size; page_size < _large_page_size; page_size *= 2) {
@@ -3871,7 +3901,7 @@ char* os::pd_reserve_memory_special(size_t bytes, size_t alignment, size_t page_
   }
 
   // Ensure GetLargePageMinimum() returns a valid positive value
-  size_t large_page_min = GetLargePageMinimum();
+  size_t large_page_min = CompatGetLargePageMinimum();
   if (large_page_min <= 0) {
     return nullptr;
   }
