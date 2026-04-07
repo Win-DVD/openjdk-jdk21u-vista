@@ -31,6 +31,7 @@
 #include "logging/logHandle.hpp"
 #include "memory/allocation.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 #include "utilities/numberSeq.hpp"
 #include "utilities/ticks.hpp"
 
@@ -281,7 +282,7 @@ public:
 //
 class XStatTimerDisable : public StackObj {
 private:
-  static THREAD_LOCAL uint32_t _active;
+  static ThreadLocalValue<uint32_t> _active;
 
 public:
   XStatTimerDisable() {

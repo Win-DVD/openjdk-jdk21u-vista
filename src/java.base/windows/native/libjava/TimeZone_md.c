@@ -42,6 +42,112 @@
 #define WIN_TZ_KEY              "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Time Zones"
 #define WIN_CURRENT_TZ_KEY      "System\\CurrentControlSet\\Control\\TimeZoneInformation"
 
+// GetDynamicTimeZoneInformation
+static BOOL
+CompatReadRegDword(HKEY hKey, LPCWSTR name, DWORD* outVal)
+{
+    DWORD type = 0, cb = sizeof(DWORD), val = 0;
+    LONG r = RegQueryValueExW(hKey, name, NULL, &type, (LPBYTE)&val, &cb);
+    if (r == ERROR_SUCCESS && type == REG_DWORD && cb == sizeof(DWORD)) {
+        *outVal = val;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL
+CompatReadRegSzW(HKEY hKey, LPCWSTR name, LPWSTR buf, DWORD cchBuf)
+{
+    DWORD type = 0, cb = cchBuf * sizeof(WCHAR);
+    LONG r = RegQueryValueExW(hKey, name, NULL, &type, (LPBYTE)buf, &cb);
+    if (r == ERROR_SUCCESS && (type == REG_SZ || type == REG_EXPAND_SZ)) {
+        buf[cchBuf - 1] = 0;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static DWORD WINAPI
+CompatGetDynamicTimeZoneInformation(PDYNAMIC_TIME_ZONE_INFORMATION pTimeZoneInformation)
+{
+    typedef DWORD (WINAPI *PFN_GetDynamicTimeZoneInformation)(PDYNAMIC_TIME_ZONE_INFORMATION);
+
+    static PFN_GetDynamicTimeZoneInformation pGetDynamicTimeZoneInformation = NULL;
+    static LONG initState_GDTZI = 0;
+
+    if (InterlockedCompareExchange(&initState_GDTZI, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetDynamicTimeZoneInformation = (PFN_GetDynamicTimeZoneInformation)
+                GetProcAddress(hKernel32, "GetDynamicTimeZoneInformation");
+        }
+        InterlockedExchange(&initState_GDTZI, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GDTZI, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetDynamicTimeZoneInformation != NULL) {
+        return pGetDynamicTimeZoneInformation(pTimeZoneInformation);
+    }
+
+    if (pTimeZoneInformation == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return TIME_ZONE_ID_INVALID;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    TIME_ZONE_INFORMATION tzi;
+    DWORD tt = GetTimeZoneInformation(&tzi);
+    if (tt == TIME_ZONE_ID_INVALID) {
+        return TIME_ZONE_ID_INVALID;
+    }
+
+    ZeroMemory(pTimeZoneInformation, sizeof(*pTimeZoneInformation));
+
+    pTimeZoneInformation->Bias = tzi.Bias;
+    pTimeZoneInformation->StandardBias = tzi.StandardBias;
+    pTimeZoneInformation->DaylightBias = tzi.DaylightBias;
+    pTimeZoneInformation->StandardDate = tzi.StandardDate;
+    pTimeZoneInformation->DaylightDate = tzi.DaylightDate;
+
+    wcsncpy(pTimeZoneInformation->StandardName, tzi.StandardName,
+            (sizeof(pTimeZoneInformation->StandardName) / sizeof(WCHAR)) - 1);
+    wcsncpy(pTimeZoneInformation->DaylightName, tzi.DaylightName,
+            (sizeof(pTimeZoneInformation->DaylightName) / sizeof(WCHAR)) - 1);
+
+    HKEY hKey = NULL;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation",
+                      0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+
+        DWORD v = 0;
+        if (CompatReadRegDword(hKey, L"DynamicDaylightTimeDisabled", &v)) {
+            pTimeZoneInformation->DynamicDaylightTimeDisabled = (v != 0);
+        } else if (CompatReadRegDword(hKey, L"DisableAutoDaylightTimeSet", &v)) {
+            pTimeZoneInformation->DynamicDaylightTimeDisabled = (v != 0);
+        }
+
+        CompatReadRegSzW(hKey, L"TimeZoneKeyName",
+                         pTimeZoneInformation->TimeZoneKeyName,
+                         (DWORD)(sizeof(pTimeZoneInformation->TimeZoneKeyName) / sizeof(WCHAR)));
+
+        if (pTimeZoneInformation->StandardName[0] == 0) {
+            CompatReadRegSzW(hKey, L"StandardName",
+                             pTimeZoneInformation->StandardName,
+                             (DWORD)(sizeof(pTimeZoneInformation->StandardName) / sizeof(WCHAR)));
+        }
+
+        RegCloseKey(hKey);
+    }
+
+    SetLastError(saved_le);
+    return tt;
+}
+// end GetDynamicTimeZoneInformation
+
 typedef struct _TziValue {
     LONG        bias;
     LONG        stdBias;
@@ -160,7 +266,7 @@ static int getWinTimeZone(char *winZoneName, size_t winZoneNameBufSize)
      * Get the dynamic time zone information so that time zone redirection
      * can be supported. (see JDK-7044727)
      */
-    timeType = GetDynamicTimeZoneInformation(&dtzi);
+    timeType = CompatGetDynamicTimeZoneInformation(&dtzi);
     if (timeType == TIME_ZONE_ID_INVALID) {
         goto err;
     }

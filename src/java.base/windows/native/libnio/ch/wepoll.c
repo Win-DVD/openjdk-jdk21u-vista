@@ -193,6 +193,684 @@ typedef NTSTATUS* PNTSTATUS;
 #define STATUS_NOT_FOUND ((NTSTATUS) 0xC0000225L)
 #endif
 
+// GetTickCount64
+static ULONGLONG WINAPI
+CompatGetTickCount64(void)
+{
+    typedef ULONGLONG (WINAPI *PFN_GetTickCount64)(VOID);
+
+    static PFN_GetTickCount64 pGetTickCount64 = NULL;
+    static LONG initState_GTC64 = 0;
+
+    static LONG lock_GTC64 = 0;
+    static DWORD lastLow_GTC64 = 0;
+    static DWORD high32_GTC64 = 0;
+    static LONG haveState_GTC64 = 0;
+
+    if (InterlockedCompareExchange(&initState_GTC64, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetTickCount64 = (PFN_GetTickCount64)
+                GetProcAddress(hKernel32, "GetTickCount64");
+        }
+        InterlockedExchange(&initState_GTC64, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GTC64, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetTickCount64 != NULL) {
+        return pGetTickCount64();
+    }
+
+    while (InterlockedCompareExchange(&lock_GTC64, 1, 0) != 0) {
+        SwitchToThread();
+    }
+
+    DWORD now = GetTickCount();
+
+    if (haveState_GTC64 == 0) {
+        lastLow_GTC64 = now;
+        high32_GTC64 = 0;
+        haveState_GTC64 = 1;
+        InterlockedExchange(&lock_GTC64, 0);
+        return (ULONGLONG)now;
+    }
+
+    if (now < lastLow_GTC64) {
+        high32_GTC64++;
+    }
+
+    lastLow_GTC64 = now;
+
+    ULONGLONG result = (((ULONGLONG)high32_GTC64) << 32) | (ULONGLONG)now;
+
+    InterlockedExchange(&lock_GTC64, 0);
+    return result;
+}
+// end GetTickCount64
+
+// InitOnceExecuteOnce
+static BOOL WINAPI
+CompatInitOnceExecuteOnce(PINIT_ONCE InitOnce,
+                          PINIT_ONCE_FN InitFn,
+                          PVOID Parameter,
+                          LPVOID *Context)
+{
+    typedef BOOL (WINAPI *PFN_InitOnceExecuteOnce)(PINIT_ONCE, PINIT_ONCE_FN, PVOID, LPVOID*);
+
+    static PFN_InitOnceExecuteOnce pInitOnceExecuteOnce = NULL;
+    static LONG initState_IOEO = 0;
+
+    if (InterlockedCompareExchange(&initState_IOEO, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pInitOnceExecuteOnce = (PFN_InitOnceExecuteOnce)
+                GetProcAddress(hKernel32, "InitOnceExecuteOnce");
+        }
+        InterlockedExchange(&initState_IOEO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_IOEO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pInitOnceExecuteOnce != NULL) {
+        return pInitOnceExecuteOnce(InitOnce, InitFn, Parameter, Context);
+    }
+
+    if (InitOnce == NULL || InitFn == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    for (;;) {
+        ULONG_PTR val = (ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL);
+        switch (val & 3) {
+        case 2:
+            if (Context) *Context = (PVOID)(val & ~(ULONG_PTR)3);
+            return TRUE;
+
+        case 0:
+            if ((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, (PVOID)1, NULL) == 0) {
+                PVOID ctx = NULL;
+                BOOL ok = InitFn(InitOnce, Parameter, &ctx);
+                if (ok) {
+                    if (((ULONG_PTR)ctx & 3) != 0) {
+                        SetLastError(ERROR_INVALID_PARAMETER);
+                        InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                        return FALSE;
+                    }
+                    InterlockedExchangePointer(&InitOnce->Ptr, (PVOID)((ULONG_PTR)ctx | 2));
+                    if (Context) *Context = ctx;
+                    return TRUE;
+                } else {
+                    InterlockedExchangePointer(&InitOnce->Ptr, NULL);
+                    if (GetLastError() == 0) {
+                        SetLastError(ERROR_GEN_FAILURE);
+                    }
+                    return FALSE;
+                }
+            }
+            break;
+
+        case 1:
+            while ((((ULONG_PTR)InterlockedCompareExchangePointer(&InitOnce->Ptr, NULL, NULL)) & 3) == 1) {
+                SwitchToThread();
+            }
+            break;
+
+        default:
+            SetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
+}
+// end InitOnceExecuteOnce
+
+// GetQueuedCompletionStatusEx
+static BOOL WINAPI
+CompatGetQueuedCompletionStatusEx(HANDLE CompletionPort,
+                                  LPOVERLAPPED_ENTRY lpCompletionPortEntries,
+                                  ULONG ulCount,
+                                  PULONG ulNumEntriesRemoved,
+                                  DWORD dwMilliseconds,
+                                  BOOL fAlertable)
+{
+    typedef BOOL (WINAPI *PFN_GetQueuedCompletionStatusEx)(
+        HANDLE, LPOVERLAPPED_ENTRY, ULONG, PULONG, DWORD, BOOL);
+
+    static PFN_GetQueuedCompletionStatusEx pGetQueuedCompletionStatusEx = NULL;
+    static LONG initState_GQCSE = 0;
+
+    if (InterlockedCompareExchange(&initState_GQCSE, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetQueuedCompletionStatusEx = (PFN_GetQueuedCompletionStatusEx)
+                GetProcAddress(hKernel32, "GetQueuedCompletionStatusEx");
+        }
+        InterlockedExchange(&initState_GQCSE, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GQCSE, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetQueuedCompletionStatusEx != NULL) {
+        return pGetQueuedCompletionStatusEx(CompletionPort,
+                                            lpCompletionPortEntries,
+                                            ulCount,
+                                            ulNumEntriesRemoved,
+                                            dwMilliseconds,
+                                            fAlertable);
+    }
+
+    (void)fAlertable;
+
+    if (lpCompletionPortEntries == NULL || ulNumEntriesRemoved == NULL || ulCount == 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    *ulNumEntriesRemoved = 0;
+
+    for (;;) {
+        DWORD bytes = 0;
+        ULONG_PTR key = 0;
+        LPOVERLAPPED pov = NULL;
+
+        BOOL ok = GetQueuedCompletionStatus(CompletionPort,
+                                            &bytes,
+                                            &key,
+                                            &pov,
+                                            dwMilliseconds);
+
+        if (!ok && pov == NULL) {
+            /* timeout or hard failure; propagate as failure */
+            return FALSE;
+        }
+
+        lpCompletionPortEntries[0].lpCompletionKey = key;
+        lpCompletionPortEntries[0].lpOverlapped = pov;
+        lpCompletionPortEntries[0].dwNumberOfBytesTransferred = bytes;
+        lpCompletionPortEntries[0].Internal = (pov != NULL) ? (ULONG_PTR)pov->Internal : 0;
+
+        *ulNumEntriesRemoved = 1;
+
+        /* drain any additional queued completions without blocking */
+        for (ULONG i = 1; i < ulCount; i++) {
+            bytes = 0;
+            key = 0;
+            pov = NULL;
+
+            ok = GetQueuedCompletionStatus(CompletionPort,
+                                           &bytes,
+                                           &key,
+                                           &pov,
+                                           0);
+
+            if (!ok && pov == NULL) {
+                /* no more queued completions */
+                break;
+            }
+
+            lpCompletionPortEntries[i].lpCompletionKey = key;
+            lpCompletionPortEntries[i].lpOverlapped = pov;
+            lpCompletionPortEntries[i].dwNumberOfBytesTransferred = bytes;
+            lpCompletionPortEntries[i].Internal = (pov != NULL) ? (ULONG_PTR)pov->Internal : 0;
+
+            (*ulNumEntriesRemoved)++;
+        }
+
+        SetLastError(saved_le);
+        return TRUE;
+    }
+}
+// end GetQueuedCompletionStatusEx
+
+// SRW Lock stuff
+
+typedef struct CompatSrwFallbackLock
+{
+	CRITICAL_SECTION cs;
+	HANDLE semReaders;
+	HANDLE semWriters;
+	LONG readers;
+	LONG waitingReaders;
+	LONG waitingWriters;
+	LONG writerActive;
+} CompatSrwFallbackLock;
+
+static CompatSrwFallbackLock*
+Compat__GetOrCreateSrwState(PSRWLOCK SRWLock)
+{
+	CompatSrwFallbackLock* st =
+		(CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+	if (st != NULL) {
+		return st;
+	}
+
+	CompatSrwFallbackLock* nst = (CompatSrwFallbackLock*)malloc(sizeof(*nst));
+	if (nst == NULL) {
+		return NULL;
+	}
+
+	ZeroMemory(nst, sizeof(*nst));
+
+	InitializeCriticalSection(&nst->cs);
+
+	nst->semReaders = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+	nst->semWriters = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+
+	if (nst->semReaders == NULL || nst->semWriters == NULL) {
+		if (nst->semReaders) CloseHandle(nst->semReaders);
+		if (nst->semWriters) CloseHandle(nst->semWriters);
+		DeleteCriticalSection(&nst->cs);
+		free(nst);
+		return NULL;
+	}
+
+	if (InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, (PVOID)nst, NULL) != NULL) {
+		CloseHandle(nst->semReaders);
+		CloseHandle(nst->semWriters);
+		DeleteCriticalSection(&nst->cs);
+		free(nst);
+	}
+
+	return (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+}
+
+static CompatSrwFallbackLock*
+Compat__GetGlobalSrwFallbackState(void)
+{
+	static CompatSrwFallbackLock g_srw;
+	static LONG initState_SRWCS = 0;
+
+	if (InterlockedCompareExchange(&initState_SRWCS, 1, 0) == 0) {
+		ZeroMemory(&g_srw, sizeof(g_srw));
+		InitializeCriticalSection(&g_srw.cs);
+		g_srw.semReaders = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+		g_srw.semWriters = CreateSemaphoreW(NULL, 0, 0x7fffffff, NULL);
+		InterlockedExchange(&initState_SRWCS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_SRWCS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	return &g_srw;
+}
+
+static VOID
+Compat__FallbackAcquireExclusive(CompatSrwFallbackLock* st)
+{
+	EnterCriticalSection(&st->cs);
+	if (st->writerActive == 0 && st->readers == 0) {
+		st->writerActive = 1;
+		LeaveCriticalSection(&st->cs);
+		return;
+	}
+
+	st->waitingWriters++;
+	LeaveCriticalSection(&st->cs);
+
+	WaitForSingleObject(st->semWriters, INFINITE);
+}
+
+static VOID
+Compat__FallbackReleaseExclusive(CompatSrwFallbackLock* st)
+{
+	LONG n;
+
+	EnterCriticalSection(&st->cs);
+
+	st->writerActive = 0;
+
+	if (st->waitingWriters > 0) {
+		st->writerActive = 1;
+		st->waitingWriters--;
+		LeaveCriticalSection(&st->cs);
+		ReleaseSemaphore(st->semWriters, 1, NULL);
+		return;
+	}
+
+	if (st->waitingReaders > 0) {
+		n = st->waitingReaders;
+		st->waitingReaders = 0;
+		st->readers = n;
+		LeaveCriticalSection(&st->cs);
+		ReleaseSemaphore(st->semReaders, n, NULL);
+		return;
+	}
+
+	LeaveCriticalSection(&st->cs);
+}
+
+static VOID
+Compat__FallbackAcquireShared(CompatSrwFallbackLock* st)
+{
+	EnterCriticalSection(&st->cs);
+	if (st->writerActive == 0 && st->waitingWriters == 0) {
+		st->readers++;
+		LeaveCriticalSection(&st->cs);
+		return;
+	}
+
+	st->waitingReaders++;
+	LeaveCriticalSection(&st->cs);
+
+	WaitForSingleObject(st->semReaders, INFINITE);
+}
+
+static VOID
+Compat__FallbackReleaseShared(CompatSrwFallbackLock* st)
+{
+	LONG n;
+
+	EnterCriticalSection(&st->cs);
+
+	st->readers--;
+
+	if (st->readers == 0) {
+		if (st->waitingWriters > 0) {
+			st->writerActive = 1;
+			st->waitingWriters--;
+			LeaveCriticalSection(&st->cs);
+			ReleaseSemaphore(st->semWriters, 1, NULL);
+			return;
+		}
+
+		if (st->waitingReaders > 0) {
+			n = st->waitingReaders;
+			st->waitingReaders = 0;
+			st->readers = n;
+			LeaveCriticalSection(&st->cs);
+			ReleaseSemaphore(st->semReaders, n, NULL);
+			return;
+		}
+	}
+
+	LeaveCriticalSection(&st->cs);
+}
+
+// InitializeSRWLock
+static VOID WINAPI
+CompatInitializeSRWLock(PSRWLOCK SRWLock)
+{
+	typedef VOID(WINAPI *PFN_InitializeSRWLock)(PSRWLOCK);
+
+	static PFN_InitializeSRWLock pInitializeSRWLock = NULL;
+	static LONG initState_ISRW = 0;
+
+	if (InterlockedCompareExchange(&initState_ISRW, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pInitializeSRWLock = (PFN_InitializeSRWLock)
+				GetProcAddress(hKernel32, "InitializeSRWLock");
+		}
+		InterlockedExchange(&initState_ISRW, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ISRW, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	if (pInitializeSRWLock != NULL) {
+		pInitializeSRWLock(SRWLock);
+		return;
+	}
+
+	if (SRWLock != NULL) {
+		InterlockedExchangePointer((PVOID*)&SRWLock->Ptr, NULL);
+	}
+}
+// end InitializeSRWLock
+
+// AcquireSRWLockExclusive
+static VOID WINAPI
+CompatAcquireSRWLockExclusive(PSRWLOCK SRWLock)
+{
+	typedef VOID(WINAPI *PFN_AcquireSRWLockExclusive)(PSRWLOCK);
+
+	static PFN_AcquireSRWLockExclusive pAcquireSRWLockExclusive = NULL;
+	static LONG initState_ASRWX = 0;
+
+	if (InterlockedCompareExchange(&initState_ASRWX, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pAcquireSRWLockExclusive = (PFN_AcquireSRWLockExclusive)
+				GetProcAddress(hKernel32, "AcquireSRWLockExclusive");
+		}
+		InterlockedExchange(&initState_ASRWX, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ASRWX, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	if (pAcquireSRWLockExclusive != NULL) {
+		pAcquireSRWLockExclusive(SRWLock);
+		return;
+	}
+
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
+
+		if (SRWLock != NULL) {
+			st = Compat__GetOrCreateSrwState(SRWLock);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
+
+		Compat__FallbackAcquireExclusive(st);
+		SetLastError(saved_le);
+	}
+}
+// end AcquireSRWLockExclusive
+
+// ReleaseSRWLockExclusive
+static VOID WINAPI
+CompatReleaseSRWLockExclusive(PSRWLOCK SRWLock)
+{
+	typedef VOID(WINAPI *PFN_ReleaseSRWLockExclusive)(PSRWLOCK);
+
+	static PFN_ReleaseSRWLockExclusive pReleaseSRWLockExclusive = NULL;
+	static LONG initState_RSRWX = 0;
+
+	if (InterlockedCompareExchange(&initState_RSRWX, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pReleaseSRWLockExclusive = (PFN_ReleaseSRWLockExclusive)
+				GetProcAddress(hKernel32, "ReleaseSRWLockExclusive");
+		}
+		InterlockedExchange(&initState_RSRWX, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_RSRWX, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	if (pReleaseSRWLockExclusive != NULL) {
+		pReleaseSRWLockExclusive(SRWLock);
+		return;
+	}
+
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
+
+		if (SRWLock != NULL) {
+			st = (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
+
+		Compat__FallbackReleaseExclusive(st);
+		SetLastError(saved_le);
+	}
+}
+// end ReleaseSRWLockExclusive
+
+// AcquireSRWLockShared
+static VOID WINAPI
+CompatAcquireSRWLockShared(PSRWLOCK SRWLock)
+{
+	typedef VOID(WINAPI *PFN_AcquireSRWLockShared)(PSRWLOCK);
+
+	static PFN_AcquireSRWLockShared pAcquireSRWLockShared = NULL;
+	static LONG initState_ASRWS = 0;
+
+	if (InterlockedCompareExchange(&initState_ASRWS, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pAcquireSRWLockShared = (PFN_AcquireSRWLockShared)
+				GetProcAddress(hKernel32, "AcquireSRWLockShared");
+		}
+		InterlockedExchange(&initState_ASRWS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_ASRWS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	if (pAcquireSRWLockShared != NULL) {
+		pAcquireSRWLockShared(SRWLock);
+		return;
+	}
+
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
+
+		if (SRWLock != NULL) {
+			st = Compat__GetOrCreateSrwState(SRWLock);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
+
+		Compat__FallbackAcquireShared(st);
+		SetLastError(saved_le);
+	}
+}
+// end AcquireSRWLockShared
+
+// ReleaseSRWLockShared
+static VOID WINAPI
+CompatReleaseSRWLockShared(PSRWLOCK SRWLock)
+{
+	typedef VOID(WINAPI *PFN_ReleaseSRWLockShared)(PSRWLOCK);
+
+	static PFN_ReleaseSRWLockShared pReleaseSRWLockShared = NULL;
+	static LONG initState_RSRWS = 0;
+
+	if (InterlockedCompareExchange(&initState_RSRWS, 1, 0) == 0) {
+		HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+		if (hKernel32) {
+			pReleaseSRWLockShared = (PFN_ReleaseSRWLockShared)
+				GetProcAddress(hKernel32, "ReleaseSRWLockShared");
+		}
+		InterlockedExchange(&initState_RSRWS, 2);
+	}
+	else {
+		while (InterlockedCompareExchange(&initState_RSRWS, 2, 2) != 2) {
+			SwitchToThread();
+		}
+	}
+
+	if (pReleaseSRWLockShared != NULL) {
+		pReleaseSRWLockShared(SRWLock);
+		return;
+	}
+
+	{
+		DWORD saved_le = GetLastError();
+		CompatSrwFallbackLock* st = NULL;
+
+		if (SRWLock != NULL) {
+			st = (CompatSrwFallbackLock*)InterlockedCompareExchangePointer((PVOID*)&SRWLock->Ptr, NULL, NULL);
+		}
+		if (st == NULL) {
+			st = Compat__GetGlobalSrwFallbackState();
+		}
+
+		Compat__FallbackReleaseShared(st);
+		SetLastError(saved_le);
+	}
+}
+// end ReleaseSRWLockShared
+// end SRW lock stuff
+
+// SetFileCompletionNotificationModes
+static BOOL WINAPI
+CompatSetFileCompletionNotificationModes(HANDLE FileHandle, UCHAR Flags)
+{
+    typedef BOOL (WINAPI *PFN_SetFileCompletionNotificationModes)(HANDLE, UCHAR);
+    typedef LONG (NTAPI *PFN_NtSetInformationFile)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+
+    static PFN_SetFileCompletionNotificationModes pSetFileCompletionNotificationModes = NULL;
+    static LONG initState_SFCNM = 0;
+
+    if (InterlockedCompareExchange(&initState_SFCNM, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pSetFileCompletionNotificationModes = (PFN_SetFileCompletionNotificationModes)
+                GetProcAddress(hKernel32, "SetFileCompletionNotificationModes");
+        }
+        InterlockedExchange(&initState_SFCNM, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_SFCNM, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pSetFileCompletionNotificationModes != NULL) {
+        return pSetFileCompletionNotificationModes(FileHandle, Flags);
+    }
+
+    if (FileHandle == NULL || FileHandle == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    {
+        HMODULE hNtdll;
+        PFN_NtSetInformationFile pNtSetInformationFile;
+        struct { ULONG Flags; } sfcnm_info;
+        struct { ULONG_PTR Status; ULONG_PTR Information; } sfcnm_iosb;
+        LONG status;
+
+        hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (hNtdll) {
+            pNtSetInformationFile = (PFN_NtSetInformationFile)
+                GetProcAddress(hNtdll, "NtSetInformationFile");
+            if (pNtSetInformationFile) {
+                sfcnm_info.Flags = (ULONG)Flags;
+                ZeroMemory(&sfcnm_iosb, sizeof(sfcnm_iosb));
+                status = pNtSetInformationFile(FileHandle, &sfcnm_iosb,
+                                               &sfcnm_info, sizeof(sfcnm_info), 41);
+                if (status == 0) {
+                    return TRUE;
+                }
+            }
+        }
+    }
+
+    return TRUE;
+}
+// end SetFileCompletionNotificationModes
+
 typedef struct _IO_STATUS_BLOCK {
   NTSTATUS Status;
   ULONG_PTR Information;
@@ -381,7 +1059,7 @@ int afd_create_device_handle(HANDLE iocp_handle,
   if (CreateIoCompletionPort(afd_device_handle, iocp_handle, 0, 0) == NULL)
     goto error;
 
-  if (!SetFileCompletionNotificationModes(afd_device_handle,
+  if (!CompatSetFileCompletionNotificationModes(afd_device_handle,
                                           FILE_SKIP_SET_EVENT_ON_HANDLE))
     goto error;
 
@@ -887,7 +1565,7 @@ static BOOL CALLBACK init__once_callback(INIT_ONCE* once,
 
 int init(void) {
   if (!init__done &&
-      !InitOnceExecuteOnce(&init__once, init__once_callback, NULL, NULL))
+      !CompatInitOnceExecuteOnce(&init__once, init__once_callback, NULL, NULL))
     /* `InitOnceExecuteOnce()` itself is infallible, and it doesn't set any
      * error code when the once-callback returns FALSE. We return -1 here to
      * indicate that global initialization failed; the failing init function is
@@ -1250,7 +1928,7 @@ static inline int port__poll(port_state_t* port_state,
 
   LeaveCriticalSection(&port_state->lock);
 
-  BOOL r = GetQueuedCompletionStatusEx(port_state->iocp_handle,
+  BOOL r = CompatGetQueuedCompletionStatusEx(port_state->iocp_handle,
                                        iocp_events,
                                        maxevents,
                                        &completion_count,
@@ -1295,7 +1973,7 @@ int port_wait(port_state_t* port_state,
   /* Compute the timeout for GetQueuedCompletionStatus, and the wait end
    * time, if the user specified a timeout other than zero or infinite. */
   if (timeout > 0) {
-    due = GetTickCount64() + (uint64_t) timeout;
+    due = CompatGetTickCount64() + (uint64_t) timeout;
     gqcs_timeout = (DWORD) timeout;
   } else if (timeout == 0) {
     gqcs_timeout = 0;
@@ -1319,7 +1997,7 @@ int port_wait(port_state_t* port_state,
       continue; /* When timeout is negative, never time out. */
 
     /* Update time. */
-    now = GetTickCount64();
+    now = CompatGetTickCount64();
 
     /* Do not allow the due time to be in the past. */
     if (now >= due) {
@@ -1934,7 +2612,7 @@ tree_node_t* sock_state_to_tree_node(sock_state_t* sock_state) {
 
 void ts_tree_init(ts_tree_t* ts_tree) {
   tree_init(&ts_tree->tree);
-  InitializeSRWLock(&ts_tree->lock);
+  CompatInitializeSRWLock(&ts_tree->lock);
 }
 
 void ts_tree_node_init(ts_tree_node_t* node) {
@@ -1945,9 +2623,9 @@ void ts_tree_node_init(ts_tree_node_t* node) {
 int ts_tree_add(ts_tree_t* ts_tree, ts_tree_node_t* node, uintptr_t key) {
   int r;
 
-  AcquireSRWLockExclusive(&ts_tree->lock);
+  CompatAcquireSRWLockExclusive(&ts_tree->lock);
   r = tree_add(&ts_tree->tree, &node->tree_node, key);
-  ReleaseSRWLockExclusive(&ts_tree->lock);
+  CompatReleaseSRWLockExclusive(&ts_tree->lock);
 
   return r;
 }
@@ -1964,7 +2642,7 @@ static inline ts_tree_node_t* ts_tree__find_node(ts_tree_t* ts_tree,
 ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
   ts_tree_node_t* ts_tree_node;
 
-  AcquireSRWLockExclusive(&ts_tree->lock);
+  CompatAcquireSRWLockExclusive(&ts_tree->lock);
 
   ts_tree_node = ts_tree__find_node(ts_tree, key);
   if (ts_tree_node != NULL) {
@@ -1972,7 +2650,7 @@ ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
     reflock_ref(&ts_tree_node->reflock);
   }
 
-  ReleaseSRWLockExclusive(&ts_tree->lock);
+  CompatReleaseSRWLockExclusive(&ts_tree->lock);
 
   return ts_tree_node;
 }
@@ -1980,13 +2658,13 @@ ts_tree_node_t* ts_tree_del_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
 ts_tree_node_t* ts_tree_find_and_ref(ts_tree_t* ts_tree, uintptr_t key) {
   ts_tree_node_t* ts_tree_node;
 
-  AcquireSRWLockShared(&ts_tree->lock);
+  CompatAcquireSRWLockShared(&ts_tree->lock);
 
   ts_tree_node = ts_tree__find_node(ts_tree, key);
   if (ts_tree_node != NULL)
     reflock_ref(&ts_tree_node->reflock);
 
-  ReleaseSRWLockShared(&ts_tree->lock);
+  CompatReleaseSRWLockShared(&ts_tree->lock);
 
   return ts_tree_node;
 }

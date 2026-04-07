@@ -26,9 +26,98 @@
 #include <versionhelpers.h>
 #include <stdio.h>
 
+// GetActiveProcessorCount
+static DWORD WINAPI
+CompatGetActiveProcessorCount(WORD GroupNumber)
+{
+    typedef DWORD (WINAPI *PFN_GetActiveProcessorCount)(WORD);
+
+    static PFN_GetActiveProcessorCount pGetActiveProcessorCount = NULL;
+    static LONG initState_GAPC = 0;
+
+    if (InterlockedCompareExchange(&initState_GAPC, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetActiveProcessorCount = (PFN_GetActiveProcessorCount)
+                GetProcAddress(hKernel32, "GetActiveProcessorCount");
+        }
+        InterlockedExchange(&initState_GAPC, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GAPC, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetActiveProcessorCount != NULL) {
+        return pGetActiveProcessorCount(GroupNumber);
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupNumber == ALL_PROCESSOR_GROUPS || GroupNumber == 0) {
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        SetLastError(saved_le);
+        return si.dwNumberOfProcessors;
+    }
+
+    SetLastError(ERROR_INVALID_PARAMETER);
+    return 0;
+}
+// end GetActiveProcessorCount
+
+// GetProcessGroupAffinity
+static BOOL WINAPI
+CompatGetProcessGroupAffinity(HANDLE hProcess, PUSHORT GroupCount, PUSHORT GroupArray)
+{
+    typedef BOOL (WINAPI *PFN_GetProcessGroupAffinity)(HANDLE, PUSHORT, PUSHORT);
+
+    static PFN_GetProcessGroupAffinity pGetProcessGroupAffinity = NULL;
+    static LONG initState_GPGA = 0;
+
+    if (InterlockedCompareExchange(&initState_GPGA, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetProcessGroupAffinity = (PFN_GetProcessGroupAffinity)
+                GetProcAddress(hKernel32, "GetProcessGroupAffinity");
+        }
+        InterlockedExchange(&initState_GPGA, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GPGA, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetProcessGroupAffinity != NULL) {
+        return pGetProcessGroupAffinity(hProcess, GroupCount, GroupArray);
+    }
+
+    (void)hProcess;
+
+    if (GroupCount == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (GroupArray == NULL || *GroupCount < 1) {
+        *GroupCount = 1;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    GroupArray[0] = 0;
+    *GroupCount = 1;
+
+    SetLastError(saved_le);
+    return TRUE;
+}
+// end GetProcessGroupAffinity
+
 int main()
 {
-  DWORD active_processor_count = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+  DWORD active_processor_count = CompatGetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
   if (active_processor_count == 0) {
     printf("GetActiveProcessorCount failed with error: %x\n", GetLastError());
     return 1;
@@ -39,7 +128,7 @@ int main()
 
   USHORT group_count = 0;
 
-  if (GetProcessGroupAffinity(GetCurrentProcess(), &group_count, NULL) == 0) {
+  if (CompatGetProcessGroupAffinity(GetCurrentProcess(), &group_count, NULL) == 0) {
     DWORD last_error = GetLastError();
     if (last_error == ERROR_INSUFFICIENT_BUFFER) {
       if (group_count == 0) {

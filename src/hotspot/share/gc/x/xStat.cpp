@@ -794,7 +794,7 @@ void XStatCriticalPhase::register_end(const Ticks& start, const Ticks& end) cons
 //
 // Stat timer
 //
-THREAD_LOCAL uint32_t XStatTimerDisable::_active = 0;
+ThreadLocalValue<uint32_t> XStatTimerDisable::_active(0);
 
 //
 // Stat sample/inc

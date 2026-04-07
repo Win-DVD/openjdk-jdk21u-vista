@@ -27,6 +27,262 @@
 
 #include "runtime/os.hpp"
 
+// Condition Variable API stuff
+typedef struct _COMPAT_CV_STATE {
+    CRITICAL_SECTION lock;
+    LONG waiters;
+    LONG was_broadcast;
+    HANDLE sema;
+    HANDLE waiters_done;
+} COMPAT_CV_STATE;
+
+static COMPAT_CV_STATE*
+CompatCvGetState(PCONDITION_VARIABLE cv, BOOL create_if_missing)
+{
+    PVOID p;
+    COMPAT_CV_STATE* s;
+
+    if (cv == NULL) return NULL;
+
+    for (;;) {
+        p = InterlockedCompareExchangePointer((PVOID*)&cv->Ptr, NULL, NULL);
+        if (p == NULL) break;
+        if (p != (PVOID)1) return (COMPAT_CV_STATE*)p;
+        SwitchToThread();
+    }
+
+    if (!create_if_missing) return NULL;
+
+    if (InterlockedCompareExchangePointer((PVOID*)&cv->Ptr, (PVOID)1, NULL) != NULL) {
+        for (;;) {
+            p = InterlockedCompareExchangePointer((PVOID*)&cv->Ptr, NULL, NULL);
+            if (p != (PVOID)1) break;
+            SwitchToThread();
+        }
+        return (p && p != (PVOID)1) ? (COMPAT_CV_STATE*)p : NULL;
+    }
+
+    s = (COMPAT_CV_STATE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(*s));
+    if (s == NULL) {
+        InterlockedExchangePointer((PVOID*)&cv->Ptr, NULL);
+        return NULL;
+    }
+
+    InitializeCriticalSection(&s->lock);
+
+    s->sema = CreateSemaphore(NULL, 0, 0x7fffffff, NULL);
+    s->waiters_done = CreateEvent(NULL, FALSE, FALSE, NULL);
+
+    if (s->sema == NULL || s->waiters_done == NULL) {
+        if (s->sema) CloseHandle(s->sema);
+        if (s->waiters_done) CloseHandle(s->waiters_done);
+        DeleteCriticalSection(&s->lock);
+        HeapFree(GetProcessHeap(), 0, s);
+        InterlockedExchangePointer((PVOID*)&cv->Ptr, NULL);
+        return NULL;
+    }
+
+    InterlockedExchangePointer((PVOID*)&cv->Ptr, s);
+    return s;
+}
+
+static DWORD WINAPI
+CompatSleepConditionVariableCS_Worker(LPVOID)
+{
+    return 0;
+}
+
+// InitializeConditionVariable
+static VOID WINAPI
+CompatInitializeConditionVariable(PCONDITION_VARIABLE ConditionVariable)
+{
+    typedef VOID (WINAPI *PFN_InitializeConditionVariable)(PCONDITION_VARIABLE);
+
+    static PFN_InitializeConditionVariable pInitializeConditionVariable = NULL;
+    static LONG initState_ICV = 0;
+
+    if (InterlockedCompareExchange(&initState_ICV, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pInitializeConditionVariable = (PFN_InitializeConditionVariable)
+                GetProcAddress(hKernel32, "InitializeConditionVariable");
+        }
+        InterlockedExchange(&initState_ICV, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_ICV, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pInitializeConditionVariable != NULL) {
+        pInitializeConditionVariable(ConditionVariable);
+        return;
+    }
+
+    if (ConditionVariable != NULL) {
+        InterlockedExchangePointer((PVOID*)&ConditionVariable->Ptr, NULL);
+    }
+}
+// end InitializeConditionVariable
+
+// WakeConditionVariable
+static VOID WINAPI
+CompatWakeConditionVariable(PCONDITION_VARIABLE ConditionVariable)
+{
+    typedef VOID (WINAPI *PFN_WakeConditionVariable)(PCONDITION_VARIABLE);
+
+    static PFN_WakeConditionVariable pWakeConditionVariable = NULL;
+    static LONG initState_WCV = 0;
+
+    if (InterlockedCompareExchange(&initState_WCV, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pWakeConditionVariable = (PFN_WakeConditionVariable)
+                GetProcAddress(hKernel32, "WakeConditionVariable");
+        }
+        InterlockedExchange(&initState_WCV, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_WCV, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pWakeConditionVariable != NULL) {
+        pWakeConditionVariable(ConditionVariable);
+        return;
+    }
+
+    COMPAT_CV_STATE* s = CompatCvGetState(ConditionVariable, FALSE);
+    if (s == NULL) return;
+
+    EnterCriticalSection(&s->lock);
+    LONG have = s->waiters;
+    LeaveCriticalSection(&s->lock);
+
+    if (have > 0) {
+        ReleaseSemaphore(s->sema, 1, NULL);
+    }
+}
+// end WakeConditionVariable
+
+// WakeAllConditionVariable
+static VOID WINAPI
+CompatWakeAllConditionVariable(PCONDITION_VARIABLE ConditionVariable)
+{
+    typedef VOID (WINAPI *PFN_WakeAllConditionVariable)(PCONDITION_VARIABLE);
+
+    static PFN_WakeAllConditionVariable pWakeAllConditionVariable = NULL;
+    static LONG initState_WACV = 0;
+
+    if (InterlockedCompareExchange(&initState_WACV, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pWakeAllConditionVariable = (PFN_WakeAllConditionVariable)
+                GetProcAddress(hKernel32, "WakeAllConditionVariable");
+        }
+        InterlockedExchange(&initState_WACV, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_WACV, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pWakeAllConditionVariable != NULL) {
+        pWakeAllConditionVariable(ConditionVariable);
+        return;
+    }
+
+    COMPAT_CV_STATE* s = CompatCvGetState(ConditionVariable, FALSE);
+    if (s == NULL) return;
+
+    EnterCriticalSection(&s->lock);
+    LONG n = s->waiters;
+    if (n > 0) {
+        s->was_broadcast = 1;
+        ResetEvent(s->waiters_done);
+        ReleaseSemaphore(s->sema, n, NULL);
+        LeaveCriticalSection(&s->lock);
+
+        WaitForSingleObject(s->waiters_done, INFINITE);
+
+        EnterCriticalSection(&s->lock);
+        s->was_broadcast = 0;
+    }
+    LeaveCriticalSection(&s->lock);
+}
+// end WakeAllConditionVariable
+
+// SleepConditionVariableCS
+static BOOL WINAPI
+CompatSleepConditionVariableCS(PCONDITION_VARIABLE ConditionVariable,
+                               PCRITICAL_SECTION   CriticalSection,
+                               DWORD              dwMilliseconds)
+{
+    typedef BOOL (WINAPI *PFN_SleepConditionVariableCS)(PCONDITION_VARIABLE, PCRITICAL_SECTION, DWORD);
+
+    static PFN_SleepConditionVariableCS pSleepConditionVariableCS = NULL;
+    static LONG initState_SCVCS = 0;
+
+    if (InterlockedCompareExchange(&initState_SCVCS, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pSleepConditionVariableCS = (PFN_SleepConditionVariableCS)
+                GetProcAddress(hKernel32, "SleepConditionVariableCS");
+        }
+        InterlockedExchange(&initState_SCVCS, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_SCVCS, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pSleepConditionVariableCS != NULL) {
+        return pSleepConditionVariableCS(ConditionVariable, CriticalSection, dwMilliseconds);
+    }
+
+    if (ConditionVariable == NULL || CriticalSection == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    COMPAT_CV_STATE* s = CompatCvGetState(ConditionVariable, TRUE);
+    if (s == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    EnterCriticalSection(&s->lock);
+    s->waiters++;
+    LeaveCriticalSection(&s->lock);
+
+    LeaveCriticalSection(CriticalSection);
+
+    DWORD wr = WaitForSingleObject(s->sema, dwMilliseconds);
+
+    EnterCriticalSection(&s->lock);
+    s->waiters--;
+    BOOL last = (s->was_broadcast != 0 && s->waiters == 0);
+    LeaveCriticalSection(&s->lock);
+
+    if (last) {
+        SetEvent(s->waiters_done);
+    }
+
+    EnterCriticalSection(CriticalSection);
+
+    if (wr == WAIT_OBJECT_0) {
+        return TRUE;
+    }
+    if (wr == WAIT_TIMEOUT) {
+        SetLastError(ERROR_TIMEOUT);
+        return FALSE;
+    }
+
+    return FALSE;
+}
+// end SleepConditionVariableCS
+// end Condition Variable API stuff
+
 // Win32_OS defines the interface to windows operating systems
 
 class outputStream;

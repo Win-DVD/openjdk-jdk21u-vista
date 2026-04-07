@@ -56,12 +56,12 @@ class JVMFlagLookup {
   }
 
   static constexpr unsigned int hash_code(const char* s, size_t len) {
-    unsigned int h = 0;
-    while (len -- > 0) {
-      h = 31*h + (unsigned int) *s;
+    uint64_t h = 0;
+    while (len-- > 0) {
+      h = (h * 31u + static_cast<unsigned char>(*s)) & 0xffffffffULL;
       s++;
     }
-    return h;
+    return static_cast<unsigned int>(h);
   }
 
   JVMFlag* find_impl(const char* flag_name, size_t length) const;

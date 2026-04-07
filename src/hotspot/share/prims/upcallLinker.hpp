@@ -44,6 +44,9 @@ public:
                                   BasicType ret_type,
                                   jobject jabi, jobject jconv,
                                   bool needs_return_buffer, int ret_buf_size);
+#if defined(_WIN32)
+  static void on_thread_detach();
+#endif
 };
 
 #endif // SHARE_VM_PRIMS_UPCALLLINKER_HPP

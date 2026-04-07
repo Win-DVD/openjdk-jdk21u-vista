@@ -25,7 +25,21 @@
 
 ################################################################################
 # The order of these defines the priority by which we try to find them.
-VALID_VS_VERSIONS="2022 2019"
+VALID_VS_VERSIONS="2017 2022 2019"
+
+VS_DESCRIPTION_2017="Microsoft Visual Studio 2017"
+VS_VERSION_INTERNAL_2017=141
+VS_MSVCR_2017=vcruntime140.dll
+VS_MSVCP_2017=msvcp140.dll
+VS_ENVVAR_2017="VS150COMNTOOLS"
+VS_USE_UCRT_2017="true"
+VS_VS_INSTALLDIR_2017="Microsoft Visual Studio/2017"
+VS_EDITIONS_2017="BuildTools Community Professional Enterprise"
+VS_SDK_INSTALLDIR_2017=
+VS_VS_PLATFORM_NAME_2017="v141"
+VS_SDK_PLATFORM_NAME_2017=
+VS_SUPPORTED_2017=true
+VS_TOOLSET_SUPPORTED_2017=true
 
 VS_DESCRIPTION_2019="Microsoft Visual Studio 2019"
 VS_VERSION_INTERNAL_2019=142
@@ -70,7 +84,7 @@ AC_DEFUN([TOOLCHAIN_CHECK_POSSIBLE_VISUAL_STUDIO_ROOT],
     UTIL_FIXUP_PATH(VS_BASE, NOFAIL)
 
     if test "x$VS_BASE" != x && test -d "$VS_BASE"; then
-      # In VS 2019, the default installation is in a subdir named after the edition.
+      # In VS 2017/2019, the default installation is in a subdir named after the edition.
       # Find the first one present and use that.
       if test "x$VS_EDITIONS" != x; then
         for edition in $VS_EDITIONS; do

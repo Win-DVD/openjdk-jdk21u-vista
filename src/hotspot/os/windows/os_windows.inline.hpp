@@ -70,7 +70,7 @@ inline PlatformMutex::~PlatformMutex() {
 }
 
 inline PlatformMonitor::PlatformMonitor() {
-  InitializeConditionVariable(&_cond);
+  CompatInitializeConditionVariable(&_cond);
 }
 
 inline PlatformMonitor::~PlatformMonitor() {
@@ -90,11 +90,11 @@ inline bool PlatformMutex::try_lock() {
 }
 
 inline void PlatformMonitor::notify() {
-  WakeConditionVariable(&_cond);
+  CompatWakeConditionVariable(&_cond);
 }
 
 inline void PlatformMonitor::notify_all() {
-  WakeAllConditionVariable(&_cond);
+  CompatWakeAllConditionVariable(&_cond);
 }
 
 // Trim-native support, stubbed out for now, may be enabled later

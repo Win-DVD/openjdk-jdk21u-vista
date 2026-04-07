@@ -39,6 +39,7 @@
 #include "runtime/unhandledOops.hpp"
 #include "utilities/globalDefinitions.hpp"
 #include "utilities/macros.hpp"
+#include "utilities/threadLocalValue.hpp"
 #if INCLUDE_JFR
 #include "jfr/support/jfrThreadExtension.hpp"
 #endif
@@ -111,10 +112,8 @@ class Thread: public ThreadShadow {
   friend class JVMCIVMStructs;
  private:
 
-#ifndef USE_LIBRARY_BASED_TLS_ONLY
   // Current thread is maintained as a thread-local variable
-  static THREAD_LOCAL Thread* _thr_current;
-#endif
+  static ThreadLocalValue<Thread*> _thr_current;
 
   // On AArch64, the high order 32 bits are used by a "patching epoch" number
   // which reflects if this thread has executed the required fences, after

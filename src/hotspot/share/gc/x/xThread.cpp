@@ -27,12 +27,12 @@
 #include "runtime/nonJavaThread.hpp"
 #include "utilities/debug.hpp"
 
-THREAD_LOCAL bool      XThread::_initialized;
-THREAD_LOCAL uintptr_t XThread::_id;
-THREAD_LOCAL bool      XThread::_is_vm;
-THREAD_LOCAL bool      XThread::_is_java;
-THREAD_LOCAL bool      XThread::_is_worker;
-THREAD_LOCAL uint      XThread::_worker_id;
+ThreadLocalValue<bool> XThread::_initialized(false);
+ThreadLocalValue<uintptr_t> XThread::_id(0);
+ThreadLocalValue<bool> XThread::_is_vm(false);
+ThreadLocalValue<bool> XThread::_is_java(false);
+ThreadLocalValue<bool> XThread::_is_worker(false);
+ThreadLocalValue<uint> XThread::_worker_id(0);
 
 void XThread::initialize() {
   assert(!_initialized, "Already initialized");

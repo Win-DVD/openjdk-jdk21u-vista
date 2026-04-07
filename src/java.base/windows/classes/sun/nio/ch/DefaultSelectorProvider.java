@@ -36,7 +36,16 @@ import java.security.PrivilegedAction;
 public class DefaultSelectorProvider {
     private static final SelectorProviderImpl INSTANCE;
     static {
-        PrivilegedAction<SelectorProviderImpl> pa = WEPollSelectorProvider::new;
+        PrivilegedAction<SelectorProviderImpl> pa = () -> {
+            boolean useWEPoll = Boolean.getBoolean("jdk.nio.useWEPoll");
+            if (useWEPoll) {
+                try {
+                    return new WEPollSelectorProvider();
+                } catch (Throwable t) {
+                }
+            }
+            return new WindowsSelectorProvider();
+        };
         INSTANCE = AccessController.doPrivileged(pa);
     }
 

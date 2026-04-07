@@ -56,9 +56,12 @@ struct ReverseBitsFallbackImpl {
   // The unsigned integral type for calculations.
   using U = std::conditional_t<sizeof(T) <= 4, uint32_t, uint64_t>;
 
+  PRAGMA_DIAG_PUSH
+  PRAGMA_DISABLE_MSVC_WARNING(4309)
   static constexpr U rep_5555 = static_cast<U>(UINT64_C(0x5555555555555555));
   static constexpr U rep_3333 = static_cast<U>(UINT64_C(0x3333333333333333));
   static constexpr U rep_0F0F = static_cast<U>(UINT64_C(0x0F0F0F0F0F0F0F0F));
+  PRAGMA_DIAG_POP
 
  public:
   inline T operator()(T v) const {

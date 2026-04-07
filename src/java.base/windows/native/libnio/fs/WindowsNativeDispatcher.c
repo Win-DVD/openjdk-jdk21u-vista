@@ -40,6 +40,540 @@
 
 #include "sun_nio_fs_WindowsNativeDispatcher.h"
 
+// CreateSymbolicLinkW
+static BOOLEAN WINAPI
+CompatCreateSymbolicLinkW(LPCWSTR lpSymlinkFileName,
+                          LPCWSTR lpTargetFileName,
+                          DWORD   dwFlags)
+{
+    typedef BOOLEAN (WINAPI *PFN_CreateSymbolicLinkW)(LPCWSTR, LPCWSTR, DWORD);
+
+    static PFN_CreateSymbolicLinkW pCreateSymbolicLinkW = NULL;
+    static LONG initState_CSLW = 0;
+
+    if (InterlockedCompareExchange(&initState_CSLW, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pCreateSymbolicLinkW = (PFN_CreateSymbolicLinkW)
+                GetProcAddress(hKernel32, "CreateSymbolicLinkW");
+        }
+        InterlockedExchange(&initState_CSLW, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_CSLW, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pCreateSymbolicLinkW != NULL) {
+        return pCreateSymbolicLinkW(lpSymlinkFileName, lpTargetFileName, dwFlags);
+    }
+
+    (void)dwFlags;
+
+    if (lpSymlinkFileName == NULL || lpTargetFileName == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return FALSE;
+}
+// end CreateSymbolicLinkW
+
+// GetFinalPathNameByHandleW
+static DWORD WINAPI
+CompatGetFinalPathNameByHandleW(HANDLE hFile,
+                                LPWSTR lpszFilePath,
+                                DWORD cchFilePath,
+                                DWORD dwFlags)
+{
+    typedef DWORD (WINAPI *PFN_GetFinalPathNameByHandleW)(HANDLE, LPWSTR, DWORD, DWORD);
+
+    static PFN_GetFinalPathNameByHandleW pGetFinalPathNameByHandleW = NULL;
+    static LONG initState_GFPHBH = 0;
+
+    if (InterlockedCompareExchange(&initState_GFPHBH, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetFinalPathNameByHandleW = (PFN_GetFinalPathNameByHandleW)
+                GetProcAddress(hKernel32, "GetFinalPathNameByHandleW");
+        }
+        InterlockedExchange(&initState_GFPHBH, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GFPHBH, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetFinalPathNameByHandleW != NULL) {
+        return pGetFinalPathNameByHandleW(hFile, lpszFilePath, cchFilePath, dwFlags);
+    }
+
+    (void)dwFlags;
+
+    if (hFile == NULL || hFile == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+
+    typedef LONG NTSTATUS;
+    typedef struct _UNICODE_STRING {
+        USHORT Length;
+        USHORT MaximumLength;
+        PWSTR  Buffer;
+    } UNICODE_STRING;
+
+    typedef struct _OBJECT_NAME_INFORMATION {
+        UNICODE_STRING Name;
+    } OBJECT_NAME_INFORMATION;
+
+    typedef enum _OBJECT_INFORMATION_CLASS {
+        ObjectNameInformation = 1
+    } OBJECT_INFORMATION_CLASS;
+
+    typedef NTSTATUS (NTAPI *PFN_NtQueryObject)(
+        HANDLE, OBJECT_INFORMATION_CLASS, PVOID, ULONG, PULONG);
+
+    static PFN_NtQueryObject pNtQueryObject = NULL;
+    static LONG initState_NQO = 0;
+
+    if (InterlockedCompareExchange(&initState_NQO, 1, 0) == 0) {
+        HMODULE hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (hNtdll) {
+            pNtQueryObject = (PFN_NtQueryObject)
+                GetProcAddress(hNtdll, "NtQueryObject");
+        }
+        InterlockedExchange(&initState_NQO, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_NQO, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pNtQueryObject == NULL) {
+        SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return 0;
+    }
+
+    ULONG need = 0;
+    NTSTATUS st = pNtQueryObject(hFile, ObjectNameInformation, NULL, 0, &need);
+
+    if ((ULONG)st != 0xC0000004UL || need == 0) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    OBJECT_NAME_INFORMATION* oni = (OBJECT_NAME_INFORMATION*)malloc(need);
+    if (oni == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    st = pNtQueryObject(hFile, ObjectNameInformation, oni, need, &need);
+    if (st < 0) {
+        free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    if (oni->Name.Buffer == NULL || oni->Name.Length == 0) {
+        free(oni);
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD ntLen = (DWORD)(oni->Name.Length / sizeof(WCHAR));
+    WCHAR* ntPath = (WCHAR*)malloc((ntLen + 1) * sizeof(WCHAR));
+    if (ntPath == NULL) {
+        free(oni);
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+
+    memcpy(ntPath, oni->Name.Buffer, ntLen * sizeof(WCHAR));
+    ntPath[ntLen] = L'\0';
+
+    free(oni);
+
+    WCHAR* finalPath = NULL;
+
+    if (wcsncmp(ntPath, L"\\Device\\Mup\\", 12) == 0) {
+        const WCHAR* tail = ntPath + 12;
+        size_t tailLen = wcslen(tail);
+        size_t outLen = 8 + tailLen; /* "\\?\UNC\" */
+        finalPath = (WCHAR*)malloc((outLen + 1) * sizeof(WCHAR));
+        if (finalPath) {
+            wcscpy(finalPath, L"\\\\?\\UNC\\");
+            wcscat(finalPath, tail);
+        }
+    } else {
+        WCHAR drives[512];
+        DWORD dlen = GetLogicalDriveStringsW((DWORD)(sizeof(drives) / sizeof(drives[0])), drives);
+        if (dlen != 0 && dlen < (DWORD)(sizeof(drives) / sizeof(drives[0]))) {
+            WCHAR* p = drives;
+            while (*p) {
+                WCHAR drive[3];
+                WCHAR dev[512];
+
+                drive[0] = p[0];
+                drive[1] = L':';
+                drive[2] = L'\0';
+
+                if (QueryDosDeviceW(drive, dev, (DWORD)(sizeof(dev) / sizeof(dev[0]))) != 0) {
+                    size_t devLen = wcslen(dev);
+                    if (devLen > 0 && wcsncmp(ntPath, dev, devLen) == 0) {
+                        const WCHAR* tail = ntPath + devLen;
+                        size_t tailLen = wcslen(tail);
+
+                        size_t outLen = 4 /* \\?\ */ + 2 /* C: */ + tailLen;
+                        finalPath = (WCHAR*)malloc((outLen + 1) * sizeof(WCHAR));
+                        if (finalPath) {
+                            wcscpy(finalPath, L"\\\\?\\");
+                            finalPath[4] = drive[0];
+                            finalPath[5] = L':';
+                            finalPath[6] = L'\0';
+                            wcscat(finalPath, tail);
+                        }
+                        break;
+                    }
+                }
+
+                p += wcslen(p) + 1;
+            }
+        }
+    }
+
+    free(ntPath);
+
+    if (finalPath == NULL) {
+        SetLastError(ERROR_GEN_FAILURE);
+        return 0;
+    }
+
+    DWORD outChars = (DWORD)wcslen(finalPath);
+
+    if (lpszFilePath == NULL || cchFilePath == 0 || cchFilePath <= outChars) {
+        free(finalPath);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return outChars + 1;
+    }
+
+    memcpy(lpszFilePath, finalPath, outChars * sizeof(WCHAR));
+    lpszFilePath[outChars] = L'\0';
+
+    free(finalPath);
+    return outChars;
+}
+// end GetFinalPathNameByHandleW
+
+// FindFirstStreamW
+
+#define FFSW_STREAM_INFO_CLASS 22
+
+typedef struct {
+    ULONG         NextEntryOffset;
+    ULONG         StreamNameLength;
+    LARGE_INTEGER StreamSize;
+    LARGE_INTEGER StreamAllocationSize;
+    WCHAR         StreamName[1];
+} FFSW_STREAM_INFO;
+
+typedef struct FFSW_CONTEXT_tag {
+    struct FFSW_CONTEXT_tag* next;
+    BYTE* buffer;
+    BYTE* current;
+    DWORD dataSize;
+} FFSW_CONTEXT;
+
+static LONG          g_ffsw_lock = 0;
+static FFSW_CONTEXT* g_ffsw_head = NULL;
+
+static VOID
+CompatFFSW_FillData(const FFSW_STREAM_INFO* entry, WIN32_FIND_STREAM_DATA* data)
+{
+    DWORD cchName = entry->StreamNameLength / sizeof(WCHAR);
+    DWORD cchMax  = (sizeof(data->cStreamName) / sizeof(WCHAR)) - 1;
+    if (cchName > cchMax) cchName = cchMax;
+    data->StreamSize = entry->StreamSize;
+    wcsncpy(data->cStreamName, entry->StreamName, cchName);
+    data->cStreamName[cchName] = 0;
+}
+
+static VOID
+CompatFFSW_Unregister(FFSW_CONTEXT* ctx)
+{
+    FFSW_CONTEXT** pp;
+
+    while (InterlockedCompareExchange(&g_ffsw_lock, 1, 0) != 0) {
+        SwitchToThread();
+    }
+    pp = &g_ffsw_head;
+    while (*pp) {
+        if (*pp == ctx) {
+            *pp = ctx->next;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    InterlockedExchange(&g_ffsw_lock, 0);
+
+    HeapFree(GetProcessHeap(), 0, ctx->buffer);
+    HeapFree(GetProcessHeap(), 0, ctx);
+}
+
+static HANDLE WINAPI
+CompatFindFirstStreamW(LPCWSTR            lpFileName,
+                       STREAM_INFO_LEVELS InfoLevel,
+                       LPVOID             lpFindStreamData,
+                       DWORD              dwFlags)
+{
+    typedef HANDLE (WINAPI *PFN_FindFirstStreamW)(LPCWSTR, DWORD, LPVOID, DWORD);
+    typedef LONG   (NTAPI *PFN_NtQueryInformationFile)(HANDLE, PVOID, PVOID, ULONG, ULONG);
+    typedef ULONG  (NTAPI *PFN_RtlNtStatusToDosError)(LONG);
+
+    static PFN_FindFirstStreamW pFindFirstStreamW = NULL;
+    static LONG initState_FFSW = 0;
+
+    if (InterlockedCompareExchange(&initState_FFSW, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pFindFirstStreamW = (PFN_FindFirstStreamW)
+                GetProcAddress(hKernel32, "FindFirstStreamW");
+        }
+        InterlockedExchange(&initState_FFSW, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_FFSW, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pFindFirstStreamW != NULL) {
+        return pFindFirstStreamW(lpFileName, (DWORD)InfoLevel, lpFindStreamData, dwFlags);
+    }
+
+    if (lpFileName == NULL || lpFindStreamData == NULL ||
+        InfoLevel != FindStreamInfoStandard || dwFlags != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+
+    {
+        HMODULE hNtdll;
+        PFN_NtQueryInformationFile pNtQueryInformationFile;
+        PFN_RtlNtStatusToDosError  pRtlNtStatusToDosError;
+        HANDLE hFile;
+        BYTE*  buf;
+        DWORD  bufSize;
+        struct { ULONG_PTR Status; ULONG_PTR Information; } iosb;
+        LONG status;
+        FFSW_STREAM_INFO* first;
+        FFSW_CONTEXT* ctx;
+
+        hNtdll = GetModuleHandle(TEXT("NTDLL.DLL"));
+        if (!hNtdll) {
+            SetLastError(ERROR_MOD_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        pNtQueryInformationFile = (PFN_NtQueryInformationFile)
+            GetProcAddress(hNtdll, "NtQueryInformationFile");
+        if (!pNtQueryInformationFile) {
+            SetLastError(ERROR_PROC_NOT_FOUND);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        pRtlNtStatusToDosError = (PFN_RtlNtStatusToDosError)
+            GetProcAddress(hNtdll, "RtlNtStatusToDosError");
+
+        hFile = CreateFileW(lpFileName,
+                            FILE_READ_ATTRIBUTES,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            NULL,
+                            OPEN_EXISTING,
+                            FILE_FLAG_BACKUP_SEMANTICS,
+                            NULL);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return INVALID_HANDLE_VALUE;
+        }
+
+        bufSize = 4096;
+        buf = (BYTE*)HeapAlloc(GetProcessHeap(), 0, bufSize);
+        if (!buf) {
+            CloseHandle(hFile);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        for (;;) {
+            BYTE* newBuf;
+            ZeroMemory(&iosb, sizeof(iosb));
+            status = pNtQueryInformationFile(hFile, &iosb, buf, bufSize,
+                                             FFSW_STREAM_INFO_CLASS);
+            if (status == 0) {
+                break;
+            }
+            if ((ULONG)status == 0x80000005UL || (ULONG)status == 0xC0000023UL) {
+                if (bufSize >= 1024 * 1024) {
+                    HeapFree(GetProcessHeap(), 0, buf);
+                    CloseHandle(hFile);
+                    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    return INVALID_HANDLE_VALUE;
+                }
+                bufSize *= 2;
+                newBuf = (BYTE*)HeapReAlloc(GetProcessHeap(), 0, buf, bufSize);
+                if (!newBuf) {
+                    HeapFree(GetProcessHeap(), 0, buf);
+                    CloseHandle(hFile);
+                    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    return INVALID_HANDLE_VALUE;
+                }
+                buf = newBuf;
+                continue;
+            }
+            HeapFree(GetProcessHeap(), 0, buf);
+            CloseHandle(hFile);
+            SetLastError(pRtlNtStatusToDosError ? pRtlNtStatusToDosError(status)
+                                                : ERROR_GEN_FAILURE);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        CloseHandle(hFile);
+
+        if (iosb.Information == 0) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            SetLastError(ERROR_HANDLE_EOF);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        first = (FFSW_STREAM_INFO*)buf;
+        CompatFFSW_FillData(first, (WIN32_FIND_STREAM_DATA*)lpFindStreamData);
+
+        ctx = (FFSW_CONTEXT*)HeapAlloc(GetProcessHeap(), 0, sizeof(FFSW_CONTEXT));
+        if (!ctx) {
+            HeapFree(GetProcessHeap(), 0, buf);
+            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return INVALID_HANDLE_VALUE;
+        }
+
+        ctx->buffer   = buf;
+        ctx->dataSize = (DWORD)iosb.Information;
+        ctx->current  = (first->NextEntryOffset != 0 &&
+                         first->NextEntryOffset < (DWORD)iosb.Information)
+                        ? buf + first->NextEntryOffset
+                        : NULL;
+
+        while (InterlockedCompareExchange(&g_ffsw_lock, 1, 0) != 0) {
+            SwitchToThread();
+        }
+        ctx->next    = g_ffsw_head;
+        g_ffsw_head  = ctx;
+        InterlockedExchange(&g_ffsw_lock, 0);
+
+        return (HANDLE)ctx;
+    }
+}
+// end FindFirstStreamW
+
+// FindNextStreamW
+
+static BOOL WINAPI
+CompatFindNextStreamW(HANDLE hFindStream,
+                      LPVOID lpFindStreamData)
+{
+    typedef BOOL (WINAPI *PFN_FindNextStreamW)(HANDLE, LPVOID);
+
+    static PFN_FindNextStreamW pFindNextStreamW = NULL;
+    static LONG initState_FNSW = 0;
+
+    if (InterlockedCompareExchange(&initState_FNSW, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pFindNextStreamW = (PFN_FindNextStreamW)
+                GetProcAddress(hKernel32, "FindNextStreamW");
+        }
+        InterlockedExchange(&initState_FNSW, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_FNSW, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pFindNextStreamW != NULL) {
+        return pFindNextStreamW(hFindStream, lpFindStreamData);
+    }
+
+    if (hFindStream == NULL || hFindStream == INVALID_HANDLE_VALUE ||
+        lpFindStreamData == NULL) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    {
+        FFSW_CONTEXT*     ctx = (FFSW_CONTEXT*)hFindStream;
+        FFSW_STREAM_INFO* entry;
+        BYTE*             next;
+
+        if (ctx->current == NULL) {
+            CompatFFSW_Unregister(ctx);
+            SetLastError(ERROR_HANDLE_EOF);
+            return FALSE;
+        }
+
+        entry = (FFSW_STREAM_INFO*)ctx->current;
+        CompatFFSW_FillData(entry, (WIN32_FIND_STREAM_DATA*)lpFindStreamData);
+
+        if (entry->NextEntryOffset == 0) {
+            ctx->current = NULL;
+        } else {
+            next = ctx->current + entry->NextEntryOffset;
+            if (next <= ctx->current || next >= ctx->buffer + ctx->dataSize) {
+                ctx->current = NULL;
+            } else {
+                ctx->current = next;
+            }
+        }
+
+        return TRUE;
+    }
+}
+// end FindNextStreamW
+
+// FindClose
+static BOOL WINAPI
+CompatFindClose(HANDLE hFindStream)
+{
+    FFSW_CONTEXT** pp;
+    FFSW_CONTEXT*  found = NULL;
+
+    if (hFindStream == NULL || hFindStream == INVALID_HANDLE_VALUE) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+
+    while (InterlockedCompareExchange(&g_ffsw_lock, 1, 0) != 0) {
+        SwitchToThread();
+    }
+    pp = &g_ffsw_head;
+    while (*pp) {
+        if ((HANDLE)(*pp) == hFindStream) {
+            found = *pp;
+            *pp   = found->next;
+            break;
+        }
+        pp = &(*pp)->next;
+    }
+    InterlockedExchange(&g_ffsw_lock, 0);
+
+    if (found) {
+        HeapFree(GetProcessHeap(), 0, found->buffer);
+        HeapFree(GetProcessHeap(), 0, found);
+        return TRUE;
+    }
+
+    return FindClose(hFindStream);
+}
+// end FindClose
+
 /**
  * jfieldIDs
  */
@@ -331,7 +865,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_FindFirstFile0(JNIEnv* env, jclass this,
     if (handle != INVALID_HANDLE_VALUE) {
         jstring name = (*env)->NewString(env, data.cFileName, (jsize)wcslen(data.cFileName));
         if (name == NULL) {
-            FindClose(handle);
+            CompatFindClose(handle);
             return;
         }
         (*env)->SetLongField(env, obj, findFirst_handle, ptr_to_jlong(handle));
@@ -380,11 +914,11 @@ Java_sun_nio_fs_WindowsNativeDispatcher_FindFirstStream0(JNIEnv* env, jclass thi
     LPCWSTR lpFileName = jlong_to_ptr(address);
     HANDLE handle;
 
-    handle = FindFirstStreamW(lpFileName, FindStreamInfoStandard, &data, 0);
+    handle = CompatFindFirstStreamW(lpFileName, FindStreamInfoStandard, &data, 0);
     if (handle != INVALID_HANDLE_VALUE) {
         jstring name = (*env)->NewString(env, data.cStreamName, (jsize)wcslen(data.cStreamName));
         if (name == NULL) {
-            FindClose(handle);
+            CompatFindClose(handle);
             return;
         }
         (*env)->SetLongField(env, obj, findStream_handle, ptr_to_jlong(handle));
@@ -406,7 +940,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_FindNextStream0(JNIEnv* env, jclass this
     WIN32_FIND_STREAM_DATA data;
     HANDLE h = (HANDLE)jlong_to_ptr(handle);
 
-    if (FindNextStreamW(h, &data) != 0) {
+    if (CompatFindNextStreamW(h, &data) != 0) {
         return (*env)->NewString(env, data.cStreamName, (jsize)wcslen(data.cStreamName));
     } else {
         if (GetLastError() != ERROR_HANDLE_EOF)
@@ -421,7 +955,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_FindClose(JNIEnv* env, jclass this,
     jlong handle)
 {
     HANDLE h = (HANDLE)jlong_to_ptr(handle);
-    if (FindClose(h) == 0) {
+    if (CompatFindClose(h) == 0) {
         throwWindowsException(env, GetLastError());
     }
 }
@@ -1081,7 +1615,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_CreateSymbolicLink0(JNIEnv* env,
     LPCWSTR link = jlong_to_ptr(linkAddress);
     LPCWSTR target = jlong_to_ptr(targetAddress);
 
-    if (CreateSymbolicLinkW(link, target, (DWORD)flags) == 0)
+    if (CompatCreateSymbolicLinkW(link, target, (DWORD)flags) == 0)
         throwWindowsException(env, GetLastError());
 }
 
@@ -1143,7 +1677,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle(JNIEnv* env,
     HANDLE h = (HANDLE)jlong_to_ptr(handle);
     DWORD len;
 
-    len = GetFinalPathNameByHandleW(h, path, MAX_PATH, 0);
+    len = CompatGetFinalPathNameByHandleW(h, path, MAX_PATH, 0);
     if (len > 0) {
         if (len < MAX_PATH) {
             rv = (*env)->NewString(env, (const jchar *)path, (jsize)len);
@@ -1151,7 +1685,7 @@ Java_sun_nio_fs_WindowsNativeDispatcher_GetFinalPathNameByHandle(JNIEnv* env,
             len += 1;  /* return length does not include terminator */
             lpBuf = (WCHAR*)malloc(len * sizeof(WCHAR));
             if (lpBuf != NULL) {
-                len = GetFinalPathNameByHandleW(h, lpBuf, len, 0);
+                len = CompatGetFinalPathNameByHandleW(h, lpBuf, len, 0);
                 if (len > 0)  {
                     rv = (*env)->NewString(env, (const jchar *)lpBuf, (jsize)len);
                 } else {

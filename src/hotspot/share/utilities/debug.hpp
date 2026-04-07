@@ -124,8 +124,12 @@ public:
 // std::is_constant_evaluated() and it's associated intrinsic are available in
 // VS 2019 16.5.  The minimum supported version of VS 2019 is already past
 // that, so we can rely on the intrinsic being available.
+
+// now fixed for older MSVC
+#if defined(_MSC_VER) && _MSC_VER >= 1925
 #define VMASSERT_CHECK_PASSED(p) \
   ((! __builtin_is_constant_evaluated() && DebuggingContext::is_enabled()) || (p))
+#endif
 
 #endif // End dispatch on TARGET_COMPILER_xxx
 

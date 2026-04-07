@@ -33,8 +33,8 @@
 #define XCPU_UNKNOWN_SELF     ((Thread*)-2)
 
 PaddedEnd<XCPU::XCPUAffinity>* XCPU::_affinity = nullptr;
-THREAD_LOCAL Thread*           XCPU::_self     = XCPU_UNKNOWN_SELF;
-THREAD_LOCAL uint32_t          XCPU::_cpu      = 0;
+ThreadLocalValue<Thread*> XCPU::_self(XCPU_UNKNOWN_SELF);
+ThreadLocalValue<uint32_t> XCPU::_cpu(0);
 
 void XCPU::initialize() {
   assert(_affinity == nullptr, "Already initialized");
