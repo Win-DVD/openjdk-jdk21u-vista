@@ -80,6 +80,173 @@ extern "C" {
 
 char* trace = getenv("CAPI_TRACE");
 
+struct NcryptApi {
+    HMODULE hmod = NULL;
+    bool initialized = false;
+    bool available = false;
+    SECURITY_STATUS (WINAPI *decrypt)(NCRYPT_KEY_HANDLE, PBYTE, DWORD, VOID*,
+            PBYTE, DWORD, DWORD*, ULONG) = NULL;
+    SECURITY_STATUS (WINAPI *deleteKey)(NCRYPT_KEY_HANDLE, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *encrypt)(NCRYPT_KEY_HANDLE, PBYTE, DWORD, VOID*,
+            PBYTE, DWORD, DWORD*, ULONG) = NULL;
+    SECURITY_STATUS (WINAPI *exportKey)(NCRYPT_KEY_HANDLE, NCRYPT_KEY_HANDLE,
+            LPCWSTR, NCryptBufferDesc*, PBYTE, DWORD, DWORD*, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *freeObject)(NCRYPT_HANDLE) = NULL;
+    SECURITY_STATUS (WINAPI *getProperty)(NCRYPT_HANDLE, LPCWSTR,
+            PBYTE, DWORD, DWORD*, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *verifySignature)(NCRYPT_KEY_HANDLE, VOID*,
+            PBYTE, DWORD, PBYTE, DWORD, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *signHash)(NCRYPT_KEY_HANDLE, VOID*, PBYTE, DWORD,
+            PBYTE, DWORD, DWORD*, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *translateHandle)(NCRYPT_PROV_HANDLE*,
+            NCRYPT_KEY_HANDLE*, HCRYPTPROV, HCRYPTKEY, DWORD, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *importKey)(NCRYPT_PROV_HANDLE, NCRYPT_KEY_HANDLE,
+            LPCWSTR, NCryptBufferDesc*, NCRYPT_KEY_HANDLE*, PBYTE, DWORD, DWORD) = NULL;
+    SECURITY_STATUS (WINAPI *openStorageProvider)(NCRYPT_PROV_HANDLE*,
+            LPCWSTR, DWORD) = NULL;
+};
+
+static NcryptApi ncrypt_api;
+
+static void initNcryptApi() {
+    if (ncrypt_api.initialized) {
+        return;
+    }
+    ncrypt_api.initialized = true;
+    ncrypt_api.hmod = ::LoadLibraryW(L"ncrypt.dll");
+    if (ncrypt_api.hmod == NULL) {
+        return;
+    }
+
+#define LOAD_NCRYPT_SYM(field, symbol) \
+    ncrypt_api.field = reinterpret_cast<decltype(ncrypt_api.field)>( \
+            ::GetProcAddress(ncrypt_api.hmod, symbol)); \
+    if (ncrypt_api.field == NULL) { \
+        return; \
+    }
+
+    LOAD_NCRYPT_SYM(decrypt, "NCryptDecrypt");
+    LOAD_NCRYPT_SYM(deleteKey, "NCryptDeleteKey");
+    LOAD_NCRYPT_SYM(encrypt, "NCryptEncrypt");
+    LOAD_NCRYPT_SYM(exportKey, "NCryptExportKey");
+    LOAD_NCRYPT_SYM(freeObject, "NCryptFreeObject");
+    LOAD_NCRYPT_SYM(getProperty, "NCryptGetProperty");
+    LOAD_NCRYPT_SYM(verifySignature, "NCryptVerifySignature");
+    LOAD_NCRYPT_SYM(signHash, "NCryptSignHash");
+    LOAD_NCRYPT_SYM(translateHandle, "NCryptTranslateHandle");
+    LOAD_NCRYPT_SYM(importKey, "NCryptImportKey");
+    LOAD_NCRYPT_SYM(openStorageProvider, "NCryptOpenStorageProvider");
+
+#undef LOAD_NCRYPT_SYM
+
+    ncrypt_api.available = true;
+}
+
+static bool isNcryptAvailable() {
+    initNcryptApi();
+    return ncrypt_api.available;
+}
+
+static SECURITY_STATUS ncryptUnavailableStatus() {
+    return (SECURITY_STATUS)NTE_NOT_SUPPORTED;
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptDecrypt(NCRYPT_KEY_HANDLE hKey,
+        PBYTE pbInput, DWORD cbInput, VOID* pPaddingInfo, PBYTE pbOutput,
+        DWORD cbOutput, DWORD* pcbResult, ULONG dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.decrypt(hKey, pbInput, cbInput, pPaddingInfo, pbOutput,
+            cbOutput, pcbResult, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptDeleteKey(NCRYPT_KEY_HANDLE hKey,
+        DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.deleteKey(hKey, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptEncrypt(NCRYPT_KEY_HANDLE hKey,
+        PBYTE pbInput, DWORD cbInput, VOID* pPaddingInfo, PBYTE pbOutput,
+        DWORD cbOutput, DWORD* pcbResult, ULONG dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.encrypt(hKey, pbInput, cbInput, pPaddingInfo, pbOutput,
+            cbOutput, pcbResult, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptExportKey(NCRYPT_KEY_HANDLE hKey,
+        NCRYPT_KEY_HANDLE hExportKey, LPCWSTR pszBlobType,
+        NCryptBufferDesc* pParameterList, PBYTE pbOutput, DWORD cbOutput,
+        DWORD* pcbResult, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.exportKey(hKey, hExportKey, pszBlobType, pParameterList,
+            pbOutput, cbOutput, pcbResult, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptFreeObject(NCRYPT_HANDLE hObject) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.freeObject(hObject);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptGetProperty(NCRYPT_HANDLE hObject,
+        LPCWSTR pszProperty, PBYTE pbOutput, DWORD cbOutput,
+        DWORD* pcbResult, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.getProperty(hObject, pszProperty, pbOutput, cbOutput,
+            pcbResult, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptVerifySignature(NCRYPT_KEY_HANDLE hKey,
+        VOID* pPaddingInfo, PBYTE pbHashValue, DWORD cbHashValue,
+        PBYTE pbSignature, DWORD cbSignature, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.verifySignature(hKey, pPaddingInfo, pbHashValue,
+            cbHashValue, pbSignature, cbSignature, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptSignHash(NCRYPT_KEY_HANDLE hKey,
+        VOID* pPaddingInfo, PBYTE pbHashValue, DWORD cbHashValue,
+        PBYTE pbSignature, DWORD cbSignature, DWORD* pcbResult, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.signHash(hKey, pPaddingInfo, pbHashValue, cbHashValue,
+            pbSignature, cbSignature, pcbResult, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptTranslateHandle(
+        NCRYPT_PROV_HANDLE *phProvider, NCRYPT_KEY_HANDLE *phKey,
+        HCRYPTPROV hLegacyProv, HCRYPTKEY hLegacyKey, DWORD dwLegacyKeySpec,
+        DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.translateHandle(phProvider, phKey, hLegacyProv,
+            hLegacyKey, dwLegacyKeySpec, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptImportKey(NCRYPT_PROV_HANDLE hProvider,
+        NCRYPT_KEY_HANDLE hImportKey, LPCWSTR pszBlobType,
+        NCryptBufferDesc* pParameterList, NCRYPT_KEY_HANDLE* phKey,
+        PBYTE pbData, DWORD cbData, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.importKey(hProvider, hImportKey, pszBlobType,
+            pParameterList, phKey, pbData, cbData, dwFlags);
+}
+
+static SECURITY_STATUS WINAPI jdk_NCryptOpenStorageProvider(
+        NCRYPT_PROV_HANDLE *phProvider, LPCWSTR pszProviderName, DWORD dwFlags) {
+    if (!isNcryptAvailable()) return ncryptUnavailableStatus();
+    return ncrypt_api.openStorageProvider(phProvider, pszProviderName, dwFlags);
+}
+
+#define NCryptDecrypt jdk_NCryptDecrypt
+#define NCryptDeleteKey jdk_NCryptDeleteKey
+#define NCryptEncrypt jdk_NCryptEncrypt
+#define NCryptExportKey jdk_NCryptExportKey
+#define NCryptFreeObject jdk_NCryptFreeObject
+#define NCryptGetProperty jdk_NCryptGetProperty
+#define NCryptVerifySignature jdk_NCryptVerifySignature
+#define NCryptSignHash jdk_NCryptSignHash
+#define NCryptTranslateHandle jdk_NCryptTranslateHandle
+#define NCryptImportKey jdk_NCryptImportKey
+#define NCryptOpenStorageProvider jdk_NCryptOpenStorageProvider
+
 /*
  * Declare library specific JNI_Onload entry if static build
  */
@@ -511,9 +678,14 @@ JNIEXPORT void JNICALL Java_sun_security_mscapi_CKeyStore_loadKeysOrCertificateC
             BOOL bHasNoPrivateKey = FALSE;
             DWORD dwPublicKeyLength = 0;
 
+            DWORD dwAcquireFlags = CRYPT_ACQUIRE_SILENT_FLAG;
+            if (isNcryptAvailable()) {
+                dwAcquireFlags |= CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG;
+            }
+
             // First, probe it silently
             if (::CryptAcquireCertificatePrivateKey(pCertContext,
-                    CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG | CRYPT_ACQUIRE_SILENT_FLAG, NULL,
+                    dwAcquireFlags, NULL,
                     &hCryptProv, &dwKeySpec, &bCallerFreeProv) == FALSE
                 && GetLastError() != NTE_SILENT_CONTEXT)
             {
@@ -532,7 +704,11 @@ JNIEXPORT void JNICALL Java_sun_security_mscapi_CKeyStore_loadKeysOrCertificateC
                 }
 
                 // Second, acquire the key normally (not silently)
-                if (::CryptAcquireCertificatePrivateKey(pCertContext, CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG, NULL,
+                dwAcquireFlags = 0;
+                if (isNcryptAvailable()) {
+                    dwAcquireFlags |= CRYPT_ACQUIRE_ALLOW_NCRYPT_KEY_FLAG;
+                }
+                if (::CryptAcquireCertificatePrivateKey(pCertContext, dwAcquireFlags, NULL,
                         &hCryptProv, &dwKeySpec, &bCallerFreeProv) == FALSE)
                 {
                     PP("bHasNoPrivateKey = TRUE!!");
