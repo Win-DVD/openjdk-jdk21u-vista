@@ -55,6 +55,64 @@
 typedef unsigned __int32 juint;
 typedef unsigned __int64 julong;
 
+// GetTickCount64
+static ULONGLONG WINAPI
+CompatGetTickCount64(void)
+{
+    typedef ULONGLONG (WINAPI *PFN_GetTickCount64)(VOID);
+
+    static PFN_GetTickCount64 pGetTickCount64 = NULL;
+    static LONG initState_GTC64 = 0;
+
+    static LONG lock_GTC64 = 0;
+    static DWORD lastLow_GTC64 = 0;
+    static DWORD high32_GTC64 = 0;
+    static LONG haveState_GTC64 = 0;
+
+    if (InterlockedCompareExchange(&initState_GTC64, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetTickCount64 = (PFN_GetTickCount64)
+                GetProcAddress(hKernel32, "GetTickCount64");
+        }
+        InterlockedExchange(&initState_GTC64, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GTC64, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetTickCount64 != NULL) {
+        return pGetTickCount64();
+    }
+
+    while (InterlockedCompareExchange(&lock_GTC64, 1, 0) != 0) {
+        SwitchToThread();
+    }
+
+    DWORD now = GetTickCount();
+
+    if (haveState_GTC64 == 0) {
+        lastLow_GTC64 = now;
+        high32_GTC64 = 0;
+        haveState_GTC64 = 1;
+        InterlockedExchange(&lock_GTC64, 0);
+        return (ULONGLONG)now;
+    }
+
+    if (now < lastLow_GTC64) {
+        high32_GTC64++;
+    }
+
+    lastLow_GTC64 = now;
+
+    ULONGLONG result = (((ULONGLONG)high32_GTC64) << 32) | (ULONGLONG)now;
+
+    InterlockedExchange(&lock_GTC64, 0);
+    return result;
+}
+// end GetTickCount64
+
 static void set_low(jlong* value, jint low) {
     *value &= (jlong)0xffffffff << 32;
     *value |= (jlong)(julong)(juint)low;
@@ -995,7 +1053,7 @@ bindPdhFunctionPointers(HMODULE h) {
  */
 static int
 getPerformanceData(UpdateQueryP query, HCOUNTER c, PDH_FMT_COUNTERVALUE* value, DWORD format) {
-    uint64_t now = GetTickCount64();
+    uint64_t now = CompatGetTickCount64();
 
     /*
      * Need to limit how often we update the query

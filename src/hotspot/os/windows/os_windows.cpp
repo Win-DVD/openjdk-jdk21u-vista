@@ -78,6 +78,7 @@
 #include "utilities/events.hpp"
 #include "utilities/macros.hpp"
 #include "utilities/population_count.hpp"
+#include "utilities/threadLocalValue.hpp"
 #include "utilities/vmError.hpp"
 #include "windbghelp.hpp"
 #if INCLUDE_JFR
@@ -447,9 +448,13 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID reserved) {
     SymbolEngine::pre_initialize();
     break;
   case DLL_THREAD_DETACH:
+    thread_local_value_on_thread_detach();
     UpcallLinker::on_thread_detach();
     break;
   case DLL_PROCESS_DETACH:
+    if (reserved != nullptr) {
+      thread_local_value_on_process_detach();
+    }
     if (ForceTimeHighResolution) {
       timeEndPeriod(1L);
     }
