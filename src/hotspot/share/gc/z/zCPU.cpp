@@ -33,8 +33,8 @@
 #define ZCPU_UNKNOWN_SELF     ((Thread*)-2)
 
 PaddedEnd<ZCPU::ZCPUAffinity>* ZCPU::_affinity = nullptr;
-THREAD_LOCAL Thread*           ZCPU::_self     = ZCPU_UNKNOWN_SELF;
-THREAD_LOCAL uint32_t          ZCPU::_cpu      = 0;
+ThreadLocalValue<Thread*> ZCPU::_self(ZCPU_UNKNOWN_SELF);
+ThreadLocalValue<uint32_t> ZCPU::_cpu(0);
 
 void ZCPU::initialize() {
   assert(_affinity == nullptr, "Already initialized");

@@ -187,7 +187,7 @@ void WorkerThreads::run_task(WorkerTask* task, uint num_workers) {
   run_task(task);
 }
 
-THREAD_LOCAL uint WorkerThread::_worker_id = UINT_MAX;
+ThreadLocalValue<uint> WorkerThread::_worker_id(UINT_MAX);
 
 WorkerThread::WorkerThread(const char* name_prefix, uint name_suffix, WorkerTaskDispatcher* dispatcher) :
     _dispatcher(dispatcher) {

@@ -44,6 +44,7 @@
 #include "services/diagnosticArgument.hpp"
 #include "services/diagnosticFramework.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 
 
 bool register_jfr_dcmds() {
@@ -266,7 +267,7 @@ static void initialize_dummy_descriptors(GrowableArray<DCmdArgumentInfo*>* array
 
 // Since the DcmdFramework does not support dynamically allocated strings,
 // we keep them in a thread local arena. The arena is reset between invocations.
-static THREAD_LOCAL Arena* dcmd_arena = nullptr;
+static ThreadLocalValue<Arena*> dcmd_arena(nullptr);
 
 static void prepare_dcmd_string_arena(JavaThread* jt) {
   dcmd_arena = JfrThreadLocal::dcmd_arena(jt);

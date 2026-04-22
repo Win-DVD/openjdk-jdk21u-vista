@@ -28,6 +28,511 @@
 #include "java_net_InetAddress.h"
 #include "java_net_NetworkInterface.h"
 
+// ConvertLengthToIpv4Mask
+static ULONG WINAPI
+CompatConvertLengthToIpv4Mask(ULONG MaskLength, PULONG Mask)
+{
+    typedef ULONG (WINAPI *PFN_ConvertLengthToIpv4Mask)(ULONG, PULONG);
+
+    static PFN_ConvertLengthToIpv4Mask pConvertLengthToIpv4Mask = NULL;
+    static LONG initState_CLT4M = 0;
+
+    if (InterlockedCompareExchange(&initState_CLT4M, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pConvertLengthToIpv4Mask = (PFN_ConvertLengthToIpv4Mask)
+                GetProcAddress(hIphlpapi, "ConvertLengthToIpv4Mask");
+        }
+        InterlockedExchange(&initState_CLT4M, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_CLT4M, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pConvertLengthToIpv4Mask != NULL) {
+        return pConvertLengthToIpv4Mask(MaskLength, Mask);
+    }
+
+    if (Mask == NULL || MaskLength > 32) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    ULONG m;
+    if (MaskLength == 0) {
+        m = 0;
+    } else {
+        m = 0xFFFFFFFFUL << (32 - MaskLength);
+    }
+
+    *Mask = htonl(m);
+    return NO_ERROR;
+}
+// end ConvertLengthToIpv4Mask
+
+// ConvertInterfaceLuidToNameW
+static ULONG WINAPI
+CompatConvertInterfaceLuidToNameW(const NET_LUID *InterfaceLuid,
+                                  PWCHAR InterfaceName,
+                                  SIZE_T Length)
+{
+    typedef ULONG (WINAPI *PFN_ConvertInterfaceLuidToNameW)(const NET_LUID*, PWCHAR, SIZE_T);
+
+    static PFN_ConvertInterfaceLuidToNameW pConvertInterfaceLuidToNameW = NULL;
+    static LONG initState_CILTN = 0;
+
+    if (InterlockedCompareExchange(&initState_CILTN, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pConvertInterfaceLuidToNameW = (PFN_ConvertInterfaceLuidToNameW)
+                GetProcAddress(hIphlpapi, "ConvertInterfaceLuidToNameW");
+        }
+        InterlockedExchange(&initState_CILTN, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_CILTN, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pConvertInterfaceLuidToNameW != NULL) {
+        return pConvertInterfaceLuidToNameW(InterfaceLuid, InterfaceName, Length);
+    }
+
+    if (InterfaceLuid == NULL || InterfaceName == NULL || Length == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    DWORD ifIndex = (DWORD)InterfaceLuid->Value;
+    if (ifIndex == 0) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    WCHAR tmp[32];
+    int n = _snwprintf(tmp, (int)(sizeof(tmp) / sizeof(tmp[0])), L"if%lu", (unsigned long)ifIndex);
+    if (n < 0) {
+        return ERROR_GEN_FAILURE;
+    }
+
+    SIZE_T need = (SIZE_T)n + 1;
+    if (Length < need) {
+        return ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    memcpy(InterfaceName, tmp, need * sizeof(WCHAR));
+    return ERROR_SUCCESS;
+}
+// end ConvertInterfaceLuidToNameW
+
+// ConvertInterfaceNameToLuidW
+static ULONG WINAPI
+CompatConvertInterfaceNameToLuidW(PCWSTR InterfaceName,
+                                  PNET_LUID InterfaceLuid)
+{
+    typedef ULONG (WINAPI *PFN_ConvertInterfaceNameToLuidW)(PCWSTR, PNET_LUID);
+
+    static PFN_ConvertInterfaceNameToLuidW pConvertInterfaceNameToLuidW = NULL;
+    static LONG initState_CINTL = 0;
+
+    if (InterlockedCompareExchange(&initState_CINTL, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pConvertInterfaceNameToLuidW = (PFN_ConvertInterfaceNameToLuidW)
+                GetProcAddress(hIphlpapi, "ConvertInterfaceNameToLuidW");
+        }
+        InterlockedExchange(&initState_CINTL, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_CINTL, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pConvertInterfaceNameToLuidW != NULL) {
+        return pConvertInterfaceNameToLuidW(InterfaceName, InterfaceLuid);
+    }
+
+    if (InterfaceName == NULL || InterfaceLuid == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (InterfaceName[0] != L'i' || InterfaceName[1] != L'f') {
+        return ERROR_INVALID_NAME;
+    }
+
+    WCHAR* endp = NULL;
+    unsigned long v = wcstoul(InterfaceName + 2, &endp, 10);
+    if (endp == (InterfaceName + 2) || endp == NULL || *endp != L'\0' || v == 0 || v > 0xFFFFFFFFUL) {
+        return ERROR_INVALID_NAME;
+    }
+
+    InterfaceLuid->Value = (ULONG64)(DWORD)v;
+    return ERROR_SUCCESS;
+}
+// end ConvertInterfaceNameToLuidW
+
+// FreeMibTable
+static VOID WINAPI
+CompatFreeMibTable(PVOID Memory)
+{
+    typedef VOID (WINAPI *PFN_FreeMibTable)(PVOID);
+
+    static PFN_FreeMibTable pFreeMibTable = NULL;
+    static LONG initState_FMT = 0;
+
+    if (InterlockedCompareExchange(&initState_FMT, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pFreeMibTable = (PFN_FreeMibTable)
+                GetProcAddress(hIphlpapi, "FreeMibTable");
+        }
+        InterlockedExchange(&initState_FMT, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_FMT, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pFreeMibTable != NULL) {
+        pFreeMibTable(Memory);
+        return;
+    }
+
+    if (Memory != NULL) {
+        HeapFree(GetProcessHeap(), 0, Memory);
+    }
+}
+// end FreeMibTable
+
+// GetIfEntry2
+static ULONG WINAPI
+CompatGetIfEntry2(PMIB_IF_ROW2 Row)
+{
+    typedef ULONG (WINAPI *PFN_GetIfEntry2)(PMIB_IF_ROW2);
+
+    static PFN_GetIfEntry2 pGetIfEntry2 = NULL;
+    static LONG initState_GIE2 = 0;
+
+    if (InterlockedCompareExchange(&initState_GIE2, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pGetIfEntry2 = (PFN_GetIfEntry2)
+                GetProcAddress(hIphlpapi, "GetIfEntry2");
+        }
+        InterlockedExchange(&initState_GIE2, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GIE2, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetIfEntry2 != NULL) {
+        return pGetIfEntry2(Row);
+    }
+
+    if (Row == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    DWORD ifIndex = Row->InterfaceIndex;
+    if (ifIndex == 0 && Row->InterfaceLuid.Value != 0) {
+        ifIndex = (DWORD)Row->InterfaceLuid.Value;
+    }
+    if (ifIndex == 0) {
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    MIB_IFROW ifr;
+    ZeroMemory(&ifr, sizeof(ifr));
+    ifr.dwIndex = ifIndex;
+
+    ULONG r = GetIfEntry(&ifr);
+    if (r != NO_ERROR) {
+        return r;
+    }
+
+    MIB_IF_ROW2 out;
+    ZeroMemory(&out, sizeof(out));
+
+    out.InterfaceIndex = ifIndex;
+    out.InterfaceLuid.Value = (ULONG64)ifIndex;
+
+    out.Type = ifr.dwType;
+    out.Mtu = ifr.dwMtu;
+
+    out.AdminStatus = (NET_IF_ADMIN_STATUS)ifr.dwAdminStatus;
+    out.OperStatus = (IF_OPER_STATUS)ifr.dwOperStatus;
+
+    if (ifr.dwType == IF_TYPE_PPP || ifr.dwType == IF_TYPE_SLIP) {
+        out.AccessType = NET_IF_ACCESS_POINT_TO_POINT;
+    } else {
+        out.AccessType = NET_IF_ACCESS_BROADCAST;
+    }
+
+    out.PhysicalAddressLength = ifr.dwPhysAddrLen;
+    if (out.PhysicalAddressLength > IF_MAX_PHYS_ADDRESS_LENGTH) {
+        out.PhysicalAddressLength = IF_MAX_PHYS_ADDRESS_LENGTH;
+    }
+    memcpy(out.PhysicalAddress, ifr.bPhysAddr, out.PhysicalAddressLength);
+
+    if (ifr.dwDescrLen != 0) {
+        int w = MultiByteToWideChar(CP_ACP, 0, (LPCSTR)ifr.bDescr, (int)ifr.dwDescrLen,
+                                    out.Description, NDIS_IF_MAX_STRING_SIZE);
+        if (w < 0) w = 0;
+        out.Description[(w < NDIS_IF_MAX_STRING_SIZE) ? w : NDIS_IF_MAX_STRING_SIZE] = 0;
+    } else {
+        out.Description[0] = 0;
+    }
+
+    *Row = out;
+    return NO_ERROR;
+}
+// end GetIfEntry2
+
+// GetIfTable2
+static ULONG WINAPI
+CompatGetIfTable2(PMIB_IF_TABLE2 *Table)
+{
+    typedef ULONG (WINAPI *PFN_GetIfTable2)(PMIB_IF_TABLE2*);
+
+    static PFN_GetIfTable2 pGetIfTable2 = NULL;
+    static LONG initState_GIT2 = 0;
+
+    if (InterlockedCompareExchange(&initState_GIT2, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pGetIfTable2 = (PFN_GetIfTable2)
+                GetProcAddress(hIphlpapi, "GetIfTable2");
+        }
+        InterlockedExchange(&initState_GIT2, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GIT2, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetIfTable2 != NULL) {
+        return pGetIfTable2(Table);
+    }
+
+    if (Table == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    DWORD sz = 0;
+    ULONG r = GetIfTable(NULL, &sz, FALSE);
+    if (r != ERROR_INSUFFICIENT_BUFFER || sz == 0) {
+        return (r == NO_ERROR) ? ERROR_GEN_FAILURE : r;
+    }
+
+    MIB_IFTABLE* old = (MIB_IFTABLE*)HeapAlloc(GetProcessHeap(), 0, sz);
+    if (old == NULL) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    r = GetIfTable(old, &sz, FALSE);
+    if (r != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, old);
+        return r;
+    }
+
+    ULONG n = old->dwNumEntries;
+    SIZE_T outSz;
+    if (n == 0) {
+        outSz = sizeof(MIB_IF_TABLE2);
+    } else {
+        outSz = sizeof(MIB_IF_TABLE2) + (SIZE_T)(n - 1) * sizeof(MIB_IF_ROW2);
+    }
+
+    MIB_IF_TABLE2* out = (MIB_IF_TABLE2*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, outSz);
+    if (out == NULL) {
+        HeapFree(GetProcessHeap(), 0, old);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    out->NumEntries = n;
+
+    for (ULONG i = 0; i < n; i++) {
+        const MIB_IFROW* ifr = &old->table[i];
+        MIB_IF_ROW2* row = &out->Table[i];
+
+        row->InterfaceIndex = ifr->dwIndex;
+        row->InterfaceLuid.Value = (ULONG64)ifr->dwIndex;
+
+        row->Type = ifr->dwType;
+        row->Mtu = ifr->dwMtu;
+
+        row->AdminStatus = (NET_IF_ADMIN_STATUS)ifr->dwAdminStatus;
+        row->OperStatus = (IF_OPER_STATUS)ifr->dwOperStatus;
+
+        if (ifr->dwType == IF_TYPE_PPP || ifr->dwType == IF_TYPE_SLIP) {
+            row->AccessType = NET_IF_ACCESS_POINT_TO_POINT;
+        } else {
+            row->AccessType = NET_IF_ACCESS_BROADCAST;
+        }
+
+        row->PhysicalAddressLength = ifr->dwPhysAddrLen;
+        if (row->PhysicalAddressLength > IF_MAX_PHYS_ADDRESS_LENGTH) {
+            row->PhysicalAddressLength = IF_MAX_PHYS_ADDRESS_LENGTH;
+        }
+        memcpy(row->PhysicalAddress, ifr->bPhysAddr, row->PhysicalAddressLength);
+
+        if (ifr->dwDescrLen != 0) {
+            int w = MultiByteToWideChar(CP_ACP, 0, (LPCSTR)ifr->bDescr, (int)ifr->dwDescrLen,
+                                        row->Description, NDIS_IF_MAX_STRING_SIZE);
+            if (w < 0) w = 0;
+            row->Description[(w < NDIS_IF_MAX_STRING_SIZE) ? w : NDIS_IF_MAX_STRING_SIZE] = 0;
+        } else {
+            row->Description[0] = 0;
+        }
+    }
+
+    HeapFree(GetProcessHeap(), 0, old);
+    *Table = out;
+    return NO_ERROR;
+}
+// end GetIfTable2
+
+// GetUnicastIpAddressTable
+static ULONG WINAPI
+CompatGetUnicastIpAddressTable(ADDRESS_FAMILY Family,
+                               PMIB_UNICASTIPADDRESS_TABLE *Table)
+{
+    typedef ULONG (WINAPI *PFN_GetUnicastIpAddressTable)(ADDRESS_FAMILY, PMIB_UNICASTIPADDRESS_TABLE*);
+
+    static PFN_GetUnicastIpAddressTable pGetUnicastIpAddressTable = NULL;
+    static LONG initState_GUIAT = 0;
+
+    if (InterlockedCompareExchange(&initState_GUIAT, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pGetUnicastIpAddressTable = (PFN_GetUnicastIpAddressTable)
+                GetProcAddress(hIphlpapi, "GetUnicastIpAddressTable");
+        }
+        InterlockedExchange(&initState_GUIAT, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GUIAT, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetUnicastIpAddressTable != NULL) {
+        return pGetUnicastIpAddressTable(Family, Table);
+    }
+
+    if (Table == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (Family == AF_INET6) {
+        return ERROR_NOT_SUPPORTED;
+    }
+
+    DWORD sz = 0;
+    ULONG r = GetIpAddrTable(NULL, &sz, FALSE);
+    if (r != ERROR_INSUFFICIENT_BUFFER || sz == 0) {
+        return (r == NO_ERROR) ? ERROR_GEN_FAILURE : r;
+    }
+
+    MIB_IPADDRTABLE* ipt = (MIB_IPADDRTABLE*)HeapAlloc(GetProcessHeap(), 0, sz);
+    if (ipt == NULL) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    r = GetIpAddrTable(ipt, &sz, FALSE);
+    if (r != NO_ERROR) {
+        HeapFree(GetProcessHeap(), 0, ipt);
+        return r;
+    }
+
+    ULONG n = ipt->dwNumEntries;
+    SIZE_T outSz;
+    if (n == 0) {
+        outSz = sizeof(MIB_UNICASTIPADDRESS_TABLE);
+    } else {
+        outSz = sizeof(MIB_UNICASTIPADDRESS_TABLE) + (SIZE_T)(n - 1) * sizeof(MIB_UNICASTIPADDRESS_ROW);
+    }
+
+    MIB_UNICASTIPADDRESS_TABLE* out =
+        (MIB_UNICASTIPADDRESS_TABLE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, outSz);
+    if (out == NULL) {
+        HeapFree(GetProcessHeap(), 0, ipt);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    out->NumEntries = n;
+
+    for (ULONG i = 0; i < n; i++) {
+        MIB_UNICASTIPADDRESS_ROW* row = &out->Table[i];
+        const MIB_IPADDRROW* ir = &ipt->table[i];
+
+        row->InterfaceLuid.Value = (ULONG64)ir->dwIndex;
+        row->DadState = IpDadStatePreferred;
+
+        row->Address.si_family = AF_INET;
+        row->Address.Ipv4.sin_family = AF_INET;
+        row->Address.Ipv4.sin_addr.s_addr = ir->dwAddr;
+
+        ULONG m = ntohl(ir->dwMask);
+        UCHAR prefix = 0;
+        while (prefix < 32) {
+            if ((m & 0x80000000UL) == 0) break;
+            prefix++;
+            m <<= 1;
+        }
+        row->OnLinkPrefixLength = prefix;
+    }
+
+    HeapFree(GetProcessHeap(), 0, ipt);
+    *Table = out;
+    return NO_ERROR;
+}
+// end GetUnicastIpAddressTable
+
+// GetAnycastIpAddressTable
+static ULONG WINAPI
+CompatGetAnycastIpAddressTable(ADDRESS_FAMILY Family,
+                               PMIB_ANYCASTIPADDRESS_TABLE *Table)
+{
+    typedef ULONG (WINAPI *PFN_GetAnycastIpAddressTable)(ADDRESS_FAMILY, PMIB_ANYCASTIPADDRESS_TABLE*);
+
+    static PFN_GetAnycastIpAddressTable pGetAnycastIpAddressTable = NULL;
+    static LONG initState_GAIAT = 0;
+
+    if (InterlockedCompareExchange(&initState_GAIAT, 1, 0) == 0) {
+        HMODULE hIphlpapi = GetModuleHandle(TEXT("IPHLPAPI.DLL"));
+        if (hIphlpapi) {
+            pGetAnycastIpAddressTable = (PFN_GetAnycastIpAddressTable)
+                GetProcAddress(hIphlpapi, "GetAnycastIpAddressTable");
+        }
+        InterlockedExchange(&initState_GAIAT, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GAIAT, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetAnycastIpAddressTable != NULL) {
+        return pGetAnycastIpAddressTable(Family, Table);
+    }
+
+    (void)Family;
+
+    if (Table == NULL) {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    MIB_ANYCASTIPADDRESS_TABLE* out =
+        (MIB_ANYCASTIPADDRESS_TABLE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                               sizeof(MIB_ANYCASTIPADDRESS_TABLE));
+    if (out == NULL) {
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    out->NumEntries = 0;
+    *Table = out;
+    return NO_ERROR;
+}
+// end GetAnycastIpAddressTable
+
 /*
  * Windows implementation of the java.net.NetworkInterface native methods.
  * This module provides the implementations of getAll, getByName, getByIndex,
@@ -68,16 +573,16 @@ static BOOL getAddressTables(
     ULONG apiRetVal;
     ADDRESS_FAMILY addrFamily = ipv6_available() ? AF_UNSPEC : AF_INET;
 
-    apiRetVal = GetUnicastIpAddressTable(addrFamily, uniAddrs);
+    apiRetVal = CompatGetUnicastIpAddressTable(addrFamily, uniAddrs);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
                 env, JNU_JAVANETPKG "SocketException", "GetUnicastIpAddressTable");
         return FALSE;
     }
-    apiRetVal = GetAnycastIpAddressTable(addrFamily, anyAddrs);
+    apiRetVal = CompatGetAnycastIpAddressTable(addrFamily, anyAddrs);
     if (apiRetVal != NO_ERROR) {
-        FreeMibTable(*uniAddrs);
+        CompatFreeMibTable(*uniAddrs);
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
                 env, JNU_JAVANETPKG "SocketException", "GetAnycastIpAddressTable");
@@ -123,7 +628,7 @@ static jobject createNetworkInterface(
     }
 
     // set the NetworkInterface's name
-    apiRetVal = ConvertInterfaceLuidToNameW(
+    apiRetVal = CompatConvertInterfaceLuidToNameW(
             &(ifRow->InterfaceLuid), ifName, NDIS_IF_MAX_BUFFER_SIZE);
     if (apiRetVal != ERROR_SUCCESS) {
         SetLastError(apiRetVal);
@@ -223,7 +728,7 @@ static jobject createNetworkInterface(
             if (addrsCurrent->PrefixLength != NO_PREFIX) {
                 (*env)->SetShortField(
                         env, bindAddr, ni_ibmaskID, addrsCurrent->PrefixLength);
-                apiRetVal = ConvertLengthToIpv4Mask(addrsCurrent->PrefixLength, &mask);
+                apiRetVal = CompatConvertLengthToIpv4Mask(addrsCurrent->PrefixLength, &mask);
                 if (apiRetVal != NO_ERROR) {
                     freeNetaddrs(addrsHead);
                     SetLastError(apiRetVal);
@@ -323,7 +828,7 @@ static jobject createNetworkInterfaceForSingleRowWithTables(
         MIB_UNICASTIPADDRESS_TABLE *uniAddrs, MIB_ANYCASTIPADDRESS_TABLE *anyAddrs) {
     ULONG apiRetVal;
 
-    apiRetVal = GetIfEntry2(ifRow);
+    apiRetVal = CompatGetIfEntry2(ifRow);
     if (apiRetVal != NO_ERROR) {
         if (apiRetVal != ERROR_FILE_NOT_FOUND) {
             SetLastError(apiRetVal);
@@ -356,8 +861,8 @@ static jobject createNetworkInterfaceForSingleRow(
     netifObj = createNetworkInterfaceForSingleRowWithTables(
             env, ifRow, uniAddrs, anyAddrs);
 
-    FreeMibTable(uniAddrs);
-    FreeMibTable(anyAddrs);
+    CompatFreeMibTable(uniAddrs);
+    CompatFreeMibTable(anyAddrs);
 
     return netifObj;
 }
@@ -392,7 +897,7 @@ JNIEXPORT jobject JNICALL Java_java_net_NetworkInterface_getByName0(
     MIB_IF_ROW2 ifRow = {0};
 
     nameChars = (*env)->GetStringChars(env, name, NULL);
-    apiRetVal = ConvertInterfaceNameToLuidW(nameChars, &(ifRow.InterfaceLuid));
+    apiRetVal = CompatConvertInterfaceNameToLuidW(nameChars, &(ifRow.InterfaceLuid));
     (*env)->ReleaseStringChars(env, name, nameChars);
     if (apiRetVal != ERROR_SUCCESS) {
         if (apiRetVal != ERROR_INVALID_NAME) {
@@ -445,8 +950,8 @@ JNIEXPORT jobject JNICALL Java_java_net_NetworkInterface_getByInetAddress0(
     }
 
     done:
-    FreeMibTable(uniAddrs);
-    FreeMibTable(anyAddrs);
+    CompatFreeMibTable(uniAddrs);
+    CompatFreeMibTable(anyAddrs);
     return result;
 }
 
@@ -484,8 +989,8 @@ JNIEXPORT jboolean JNICALL Java_java_net_NetworkInterface_boundInetAddress0(
     }
 
     done:
-    FreeMibTable(uniAddrs);
-    FreeMibTable(anyAddrs);
+    CompatFreeMibTable(uniAddrs);
+    CompatFreeMibTable(anyAddrs);
     return result;
 }
 
@@ -503,7 +1008,7 @@ JNIEXPORT jobjectArray JNICALL Java_java_net_NetworkInterface_getAll(
     ULONG apiRetVal, i;
     jobject ifObj;
 
-    apiRetVal = GetIfTable2(&ifTable);
+    apiRetVal = CompatGetIfTable2(&ifTable);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
@@ -513,12 +1018,12 @@ JNIEXPORT jobjectArray JNICALL Java_java_net_NetworkInterface_getAll(
 
     ifArray = (*env)->NewObjectArray(env, ifTable->NumEntries, cls, NULL);
     if (ifArray == NULL) {
-        FreeMibTable(ifTable);
+        CompatFreeMibTable(ifTable);
         return NULL;
     }
 
     if (getAddressTables(env, &uniAddrs, &anyAddrs) == FALSE) {
-        FreeMibTable(ifTable);
+        CompatFreeMibTable(ifTable);
         return NULL;
     }
 
@@ -526,18 +1031,18 @@ JNIEXPORT jobjectArray JNICALL Java_java_net_NetworkInterface_getAll(
         ifObj = createNetworkInterface(
                 env, &(ifTable->Table[i]), uniAddrs, anyAddrs);
         if (ifObj == NULL) {
-            FreeMibTable(ifTable);
-            FreeMibTable(uniAddrs);
-            FreeMibTable(anyAddrs);
+            CompatFreeMibTable(ifTable);
+            CompatFreeMibTable(uniAddrs);
+            CompatFreeMibTable(anyAddrs);
             return NULL;
         }
         (*env)->SetObjectArrayElement(env, ifArray, i, ifObj);
         (*env)->DeleteLocalRef(env, ifObj);
     }
 
-    FreeMibTable(ifTable);
-    FreeMibTable(uniAddrs);
-    FreeMibTable(anyAddrs);
+    CompatFreeMibTable(ifTable);
+    CompatFreeMibTable(uniAddrs);
+    CompatFreeMibTable(anyAddrs);
     return ifArray;
 }
 
@@ -552,7 +1057,7 @@ JNIEXPORT jboolean JNICALL Java_java_net_NetworkInterface_isUp0(
     ULONG apiRetVal;
 
     ifRow.InterfaceIndex = index;
-    apiRetVal = GetIfEntry2(&ifRow);
+    apiRetVal = CompatGetIfEntry2(&ifRow);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
@@ -575,7 +1080,7 @@ JNIEXPORT jboolean JNICALL Java_java_net_NetworkInterface_isP2P0(
     ULONG apiRetVal;
 
     ifRow.InterfaceIndex = index;
-    apiRetVal = GetIfEntry2(&ifRow);
+    apiRetVal = CompatGetIfEntry2(&ifRow);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
@@ -596,7 +1101,7 @@ JNIEXPORT jboolean JNICALL Java_java_net_NetworkInterface_isLoopback0(
     ULONG apiRetVal;
 
     ifRow.InterfaceIndex = index;
-    apiRetVal = GetIfEntry2(&ifRow);
+    apiRetVal = CompatGetIfEntry2(&ifRow);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
@@ -618,7 +1123,7 @@ JNIEXPORT jbyteArray JNICALL Java_java_net_NetworkInterface_getMacAddr0(
     jbyteArray macAddr;
 
     ifRow.InterfaceIndex = index;
-    apiRetVal = GetIfEntry2(&ifRow);
+    apiRetVal = CompatGetIfEntry2(&ifRow);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(
@@ -649,7 +1154,7 @@ JNIEXPORT jint JNICALL Java_java_net_NetworkInterface_getMTU0(
     ULONG apiRetVal;
 
     ifRow.InterfaceIndex = index;
-    apiRetVal = GetIfEntry2(&ifRow);
+    apiRetVal = CompatGetIfEntry2(&ifRow);
     if (apiRetVal != NO_ERROR) {
         SetLastError(apiRetVal);
         NET_ThrowByNameWithLastError(

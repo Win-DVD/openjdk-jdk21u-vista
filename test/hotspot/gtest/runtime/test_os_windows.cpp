@@ -32,6 +32,36 @@
 #include "concurrentTestRunner.inline.hpp"
 #include "unittest.hpp"
 
+// GetLargePageMinimum
+static SIZE_T WINAPI
+CompatGetLargePageMinimum(void)
+{
+    typedef SIZE_T (WINAPI *PFN_GetLargePageMinimum)(void);
+
+    static PFN_GetLargePageMinimum pGetLargePageMinimum = NULL;
+    static LONG initState_GLPM = 0;
+
+    if (InterlockedCompareExchange(&initState_GLPM, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pGetLargePageMinimum = (PFN_GetLargePageMinimum)
+                GetProcAddress(hKernel32, "GetLargePageMinimum");
+        }
+        InterlockedExchange(&initState_GLPM, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_GLPM, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pGetLargePageMinimum != NULL) {
+        return pGetLargePageMinimum();
+    }
+
+    return (SIZE_T)(*(volatile ULONG *)((ULONG_PTR)0x7FFE0000 + 0x244));
+}
+// end GetLargePageMinimum
+
 namespace {
   class MemoryReleaser {
     char* const _ptr;
@@ -735,7 +765,7 @@ TEST_VM(os_windows, large_page_init_multiple_sizes) {
   FLAG_SET_CMDLINE(EnableAllLargePageSizesForWindows, true);
 
   // Determine the minimum page size
-  const size_t min_size = GetLargePageMinimum();
+  const size_t min_size = CompatGetLargePageMinimum();
 
   // End the test if GetLargePageMinimum returns 0
   if (min_size == 0) {
@@ -790,7 +820,7 @@ TEST_VM(os_windows, large_page_init_decide_size) {
 
   // Test for large page support
   size_t decided_size = os::win32::large_page_init_decide_size();
-  size_t min_size = GetLargePageMinimum();
+  size_t min_size = CompatGetLargePageMinimum();
   if (min_size == 0) {
     EXPECT_EQ(decided_size, 0) << "Expected decided size to be 0 when large page is not supported by the processor";
     return;

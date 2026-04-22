@@ -49,6 +49,63 @@
 #define SECURITY_WIN32
 #include <sspi.h>
 
+// CompareStringEx
+static int WINAPI
+CompatCompareStringEx(LPCWSTR lpLocaleName,
+  DWORD dwCmpFlags,
+  LPCWCH lpString1,
+  int cchCount1,
+  LPCWCH lpString2,
+  int cchCount2,
+  LPNLSVERSIONINFO lpVersionInformation,
+  LPVOID lpReserved,
+  LPARAM lParam) {
+  typedef int(WINAPI * PFN_CompareStringEx)(LPCWSTR, DWORD, LPCWCH, int, LPCWCH, int, LPNLSVERSIONINFO, LPVOID, LPARAM);
+
+  static PFN_CompareStringEx pCompareStringEx = NULL;
+  static LONG initState_CSE = 0;
+
+  if (InterlockedCompareExchange( & initState_CSE, 1, 0) == 0) {
+    HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+    if (hKernel32) {
+      pCompareStringEx = (PFN_CompareStringEx)
+      GetProcAddress(hKernel32, "CompareStringEx");
+    }
+    InterlockedExchange( & initState_CSE, 2);
+  } else {
+    while (InterlockedCompareExchange( & initState_CSE, 2, 2) != 2) {
+      SwitchToThread();
+    }
+  }
+
+  if (pCompareStringEx != NULL) {
+    return pCompareStringEx(lpLocaleName, dwCmpFlags,
+      lpString1, cchCount1, lpString2, cchCount2,
+      lpVersionInformation, lpReserved, lParam);
+  }
+
+  if (lpVersionInformation != NULL || lpReserved != NULL || lParam != 0) {
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return 0;
+  }
+
+  LCID lcid;
+
+  if (lpLocaleName == NULL || lstrcmpW(lpLocaleName, LOCALE_NAME_USER_DEFAULT) == 0) {
+    lcid = LOCALE_USER_DEFAULT;
+  } else if (lstrcmpW(lpLocaleName, LOCALE_NAME_SYSTEM_DEFAULT) == 0) {
+    lcid = LOCALE_SYSTEM_DEFAULT;
+  } else if (lstrcmpW(lpLocaleName, LOCALE_NAME_INVARIANT) == 0) {
+    lcid = LOCALE_INVARIANT;
+  } else {
+    SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+    return 0;
+  }
+
+  return CompareStringW(lcid, dwCmpFlags, lpString1, cchCount1, lpString2, cchCount2);
+}
+// end CompareStringEx
+
 // Otherwise an exception will be thrown
 #define new new (std::nothrow)
 
@@ -486,7 +543,7 @@ gss_compare_name(OM_uint32 *minor_status,
     // Note: the default name concept is not used here.
     // Principal names on Windows are case-insensitive, both user name
     // and service principal name.
-    if (CompareStringEx(LOCALE_NAME_SYSTEM_DEFAULT, NORM_IGNORECASE,
+    if (CompatCompareStringEx(LOCALE_NAME_SYSTEM_DEFAULT, NORM_IGNORECASE,
             n1, l1, n2, l1, NULL, NULL, 0) == CSTR_EQUAL) {
         *name_equal = 1;
     }

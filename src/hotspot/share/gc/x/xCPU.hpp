@@ -27,6 +27,7 @@
 #include "memory/allStatic.hpp"
 #include "memory/padded.hpp"
 #include "utilities/globalDefinitions.hpp"
+#include "utilities/threadLocalValue.hpp"
 
 class Thread;
 
@@ -37,8 +38,8 @@ private:
   };
 
   static PaddedEnd<XCPUAffinity>* _affinity;
-  static THREAD_LOCAL Thread*     _self;
-  static THREAD_LOCAL uint32_t    _cpu;
+  static ThreadLocalValue<Thread*> _self;
+  static ThreadLocalValue<uint32_t> _cpu;
 
   static uint32_t id_slow();
 

@@ -2673,10 +2673,11 @@ private:
   static void resolve() {
     typedef Config<use_compressed ? oop_kind::NARROW : oop_kind::WIDE, BarrierSetT> SelectedConfigT;
 
-    freeze_entry = (address)freeze<SelectedConfigT>;
+    typedef int      (*freeze_fn_t)(JavaThread*, intptr_t*);
+    typedef intptr_t*(*thaw_fn_t)  (JavaThread*, int);
 
-    // If we wanted, we could templatize by kind and have three different thaw entries
-    thaw_entry   = (address)thaw<SelectedConfigT>;
+    freeze_entry = CAST_FROM_FN_PTR(address, (freeze_fn_t)&freeze<SelectedConfigT>);
+    thaw_entry   = CAST_FROM_FN_PTR(address, (thaw_fn_t)  &thaw<SelectedConfigT>);
   }
 };
 

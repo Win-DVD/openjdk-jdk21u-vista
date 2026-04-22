@@ -57,6 +57,9 @@ static const ADAPTER_INFO badHardware[] = {
     // Microsoft Basic Render Driver (as maybe used in VMs such as VirtualBox)
     { 0x1414, 0x008c, NO_VERSION, OS_ALL },
 
+    // all VMware adapters due to bug in older SVGA II driver causing problems
+    { 0x15AD, ALL_DEVICEIDS, NO_VERSION, OS_ALL },
+
     // ATI Mobility Radeon X1600, X1400, X1450, X1300, X1350
     // Reason: workaround for 6613066, 6687166
     // X1300 (four sub ids)

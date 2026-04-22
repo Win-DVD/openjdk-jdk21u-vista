@@ -34,6 +34,250 @@
 #include <tlhelp32.h>
 #include <sddl.h>
 
+#ifndef PROCESS_NAME_NATIVE
+#define PROCESS_NAME_NATIVE 0x00000001
+#endif
+
+static BOOL
+CompatDevicePathToWin32Path(LPCWSTR devicePath, LPWSTR outPath, DWORD outCch)
+{
+    WCHAR drives[512];
+    DWORD n = GetLogicalDriveStringsW((DWORD)(sizeof(drives) / sizeof(drives[0]) - 1), drives);
+    if (n == 0 || n >= (DWORD)(sizeof(drives) / sizeof(drives[0]))) {
+        return FALSE;
+    }
+
+    for (WCHAR* p = drives; *p; p += wcslen(p) + 1) {
+        if (p[0] == 0 || p[1] != L':' ) {
+            continue;
+        }
+
+        WCHAR drive[3];
+        drive[0] = p[0];
+        drive[1] = L':';
+        drive[2] = 0;
+
+        WCHAR dev[512];
+        DWORD dn = QueryDosDeviceW(drive, dev, (DWORD)(sizeof(dev) / sizeof(dev[0])));
+        if (dn == 0) {
+            continue;
+        }
+
+        size_t devlen = wcslen(dev);
+        if (_wcsnicmp(devicePath, dev, devlen) == 0 &&
+            (devicePath[devlen] == L'\\' || devicePath[devlen] == 0)) {
+
+            size_t restlen = wcslen(devicePath + devlen);
+            size_t need = 2 + restlen + 1;
+            if (need > outCch) {
+                return FALSE;
+            }
+
+            outPath[0] = drive[0];
+            outPath[1] = L':';
+            memcpy(outPath + 2, devicePath + devlen, (restlen + 1) * sizeof(WCHAR));
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOL
+CompatWin32PathToDevicePath(LPCWSTR win32Path, LPWSTR outPath, DWORD outCch)
+{
+    if (win32Path == NULL || win32Path[0] == 0 || win32Path[1] != L':') {
+        return FALSE;
+    }
+
+    WCHAR drive[3];
+    drive[0] = win32Path[0];
+    drive[1] = L':';
+    drive[2] = 0;
+
+    WCHAR dev[512];
+    DWORD dn = QueryDosDeviceW(drive, dev, (DWORD)(sizeof(dev) / sizeof(dev[0])));
+    if (dn == 0) {
+        return FALSE;
+    }
+
+    size_t devlen = wcslen(dev);
+    size_t restlen = wcslen(win32Path + 2);
+    size_t need = devlen + restlen + 1;
+    if (need > outCch) {
+        return FALSE;
+    }
+
+    memcpy(outPath, dev, devlen * sizeof(WCHAR));
+    memcpy(outPath + devlen, win32Path + 2, (restlen + 1) * sizeof(WCHAR));
+    return TRUE;
+}
+
+// QueryFullProcessImageNameW
+static BOOL WINAPI
+CompatQueryFullProcessImageNameW(HANDLE hProcess, DWORD dwFlags, LPWSTR lpExeName, PDWORD lpdwSize)
+{
+    typedef BOOL (WINAPI *PFN_QueryFullProcessImageNameW)(HANDLE, DWORD, LPWSTR, PDWORD);
+    typedef BOOL (WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE*, DWORD, LPDWORD);
+    typedef DWORD (WINAPI *PFN_GetModuleFileNameExW)(HANDLE, HMODULE, LPWSTR, DWORD);
+    typedef DWORD (WINAPI *PFN_GetProcessImageFileNameW)(HANDLE, LPWSTR, DWORD);
+
+    static PFN_QueryFullProcessImageNameW pQueryFullProcessImageNameW = NULL;
+    static LONG initState_QFPIN = 0;
+
+    static HMODULE hPsapi = NULL;
+    static PFN_EnumProcessModules pEnumProcessModules = NULL;
+    static PFN_GetModuleFileNameExW pGetModuleFileNameExW = NULL;
+    static PFN_GetProcessImageFileNameW pGetProcessImageFileNameW = NULL;
+    static LONG initState_PSAPI = 0;
+
+    if (InterlockedCompareExchange(&initState_QFPIN, 1, 0) == 0) {
+        HMODULE hKernel32 = GetModuleHandle(TEXT("KERNEL32.DLL"));
+        if (hKernel32) {
+            pQueryFullProcessImageNameW = (PFN_QueryFullProcessImageNameW)
+                GetProcAddress(hKernel32, "QueryFullProcessImageNameW");
+        }
+        InterlockedExchange(&initState_QFPIN, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_QFPIN, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    if (pQueryFullProcessImageNameW != NULL) {
+        return pQueryFullProcessImageNameW(hProcess, dwFlags, lpExeName, lpdwSize);
+    }
+
+    if (lpdwSize == NULL || lpExeName == NULL) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    if ((dwFlags & ~PROCESS_NAME_NATIVE) != 0) {
+        SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    DWORD saved_le = GetLastError();
+
+    if (InterlockedCompareExchange(&initState_PSAPI, 1, 0) == 0) {
+        hPsapi = GetModuleHandle(TEXT("PSAPI.DLL"));
+        if (hPsapi == NULL) {
+            hPsapi = LoadLibrary(TEXT("PSAPI.DLL"));
+        }
+        if (hPsapi) {
+            pEnumProcessModules = (PFN_EnumProcessModules)
+                GetProcAddress(hPsapi, "EnumProcessModules");
+            pGetModuleFileNameExW = (PFN_GetModuleFileNameExW)
+                GetProcAddress(hPsapi, "GetModuleFileNameExW");
+            pGetProcessImageFileNameW = (PFN_GetProcessImageFileNameW)
+                GetProcAddress(hPsapi, "GetProcessImageFileNameW");
+        }
+        InterlockedExchange(&initState_PSAPI, 2);
+    } else {
+        while (InterlockedCompareExchange(&initState_PSAPI, 2, 2) != 2) {
+            SwitchToThread();
+        }
+    }
+
+    DWORD want = *lpdwSize;
+
+    if (want == 0) {
+        *lpdwSize = 1;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    WCHAR* tmp = (WCHAR*)HeapAlloc(GetProcessHeap(), 0, 32768 * sizeof(WCHAR));
+    if (tmp == NULL) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+    tmp[0] = 0;
+
+    BOOL ok = FALSE;
+
+    if ((dwFlags & PROCESS_NAME_NATIVE) != 0) {
+        if (pGetProcessImageFileNameW != NULL) {
+            DWORD n = pGetProcessImageFileNameW(hProcess, tmp, 32768);
+            if (n != 0 && n < 32768) {
+                ok = TRUE;
+            }
+        }
+
+        if (!ok) {
+            WCHAR w32[32768];
+            w32[0] = 0;
+
+            if (hProcess == GetCurrentProcess()) {
+                DWORD n = GetModuleFileNameW(NULL, w32, 32768);
+                if (n != 0 && n < 32768) {
+                    ok = CompatWin32PathToDevicePath(w32, tmp, 32768);
+                }
+            } else if (pEnumProcessModules && pGetModuleFileNameExW) {
+                HMODULE hm = NULL;
+                DWORD cbNeeded = 0;
+                if (pEnumProcessModules(hProcess, &hm, sizeof(hm), &cbNeeded) && hm != NULL) {
+                    DWORD n = pGetModuleFileNameExW(hProcess, hm, w32, 32768);
+                    if (n != 0 && n < 32768) {
+                        ok = CompatWin32PathToDevicePath(w32, tmp, 32768);
+                    }
+                }
+            }
+        }
+    } else {
+        if (hProcess == GetCurrentProcess()) {
+            DWORD n = GetModuleFileNameW(NULL, tmp, 32768);
+            if (n != 0 && n < 32768) {
+                ok = TRUE;
+            }
+        } else if (pEnumProcessModules && pGetModuleFileNameExW) {
+            HMODULE hm = NULL;
+            DWORD cbNeeded = 0;
+            if (pEnumProcessModules(hProcess, &hm, sizeof(hm), &cbNeeded) && hm != NULL) {
+                DWORD n = pGetModuleFileNameExW(hProcess, hm, tmp, 32768);
+                if (n != 0 && n < 32768) {
+                    ok = TRUE;
+                }
+            }
+        }
+
+        if (!ok && pGetProcessImageFileNameW != NULL) {
+            WCHAR dev[32768];
+            DWORD n = pGetProcessImageFileNameW(hProcess, dev, 32768);
+            if (n != 0 && n < 32768) {
+                ok = CompatDevicePathToWin32Path(dev, tmp, 32768);
+            }
+        }
+    }
+
+    if (!ok || tmp[0] == 0) {
+        DWORD le = GetLastError();
+        HeapFree(GetProcessHeap(), 0, tmp);
+        if (le == 0) {
+            SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        }
+        return FALSE;
+    }
+
+    size_t len = wcslen(tmp);
+
+    if (want <= (DWORD)len) {
+        *lpdwSize = (DWORD)(len + 1);
+        HeapFree(GetProcessHeap(), 0, tmp);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    memcpy(lpExeName, tmp, (len + 1) * sizeof(WCHAR));
+    *lpdwSize = (DWORD)len;
+
+    HeapFree(GetProcessHeap(), 0, tmp);
+    SetLastError(saved_le);
+    return TRUE;
+}
+// end QueryFullProcessImageNameW
+
 static void getStatInfo(JNIEnv *env, HANDLE handle, jobject jinfo);
 static void getCmdlineInfo(JNIEnv *env, HANDLE handle, jobject jinfo);
 static void procToUser(JNIEnv *env, HANDLE handle, jobject jinfo);
@@ -473,14 +717,14 @@ static void getCmdlineInfo(JNIEnv *env, HANDLE handle, jobject jinfo) {
     DWORD bufsize = sizeof(exeName)/sizeof(WCHAR);
     jstring commandObj = NULL;
 
-    if (QueryFullProcessImageNameW(handle, 0,  exeName, &bufsize)) {
+    if (CompatQueryFullProcessImageNameW(handle, 0,  exeName, &bufsize)) {
         commandObj = (*env)->NewString(env, (const jchar *)exeName,
                                        (jsize)wcslen(exeName));
     } else if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
         bufsize = 32768;
         longPath = (WCHAR*)malloc(bufsize * sizeof(WCHAR));
         if (longPath != NULL) {
-            if (QueryFullProcessImageNameW(handle, 0, longPath, &bufsize)) {
+            if (CompatQueryFullProcessImageNameW(handle, 0, longPath, &bufsize)) {
                 commandObj = (*env)->NewString(env, (const jchar *)longPath,
                                                (jsize)wcslen(longPath));
             }
